@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-OpenProject MCP Server
+OpenProject MCP Server — Consolidated Architecture (v2.1)
 
-A Model Context Protocol (MCP) server that provides integration with OpenProject API v3.
-Supports project management, work package tracking, and task creation through a
-standardized interface.
+10 parameterized tools covering ~122 API operations via operation registry.
+v2.1 adds: day/schedule, budgets, attachment upload, file links, baseline
+timestamps, custom field introspection, schema/form validation, and views.
+
+Tools: project, work_package, time_entry, membership, principal,
+       version, query_view, notification, artifact, integration
 """
 
 import os
 import json
 import logging
+import re
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import asyncio
@@ -20,84 +24,69 @@ import ssl
 from dotenv import load_dotenv
 
 from mcp.server import Server
-from mcp.types import (
-    Tool,
-    TextContent,
-)
+from mcp.types import Tool, TextContent
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Version information
-__version__ = "1.0.0"
-__author__ = "Your Name"
-__license__ = "MIT"
+__version__ = "2.1.1"
+
+
+def _parse_iso_duration_hours(duration_str: str) -> str:
+    """Parse ISO 8601 duration (PT2H30M) to decimal hours string."""
+    if not duration_str or "PT" not in duration_str:
+        return "0"
+    match = re.match(
+        r"PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?",
+        duration_str,
+    )
+    if not match:
+        return duration_str
+    h = float(match.group(1) or 0)
+    m = float(match.group(2) or 0)
+    total = h + m / 60
+    return str(int(total)) if total == int(total) else f"{total:.1f}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# OpenProject API Client
+# ═══════════════════════════════════════════════════════════════════════
 
 
 class OpenProjectClient:
-    """Client for the OpenProject API v3 with optional proxy support"""
+    """Client for the OpenProject API v3 with generic + complex helpers."""
 
     def __init__(self, base_url: str, api_key: str, proxy: Optional[str] = None):
-        """
-        Initialize the OpenProject client.
-
-        Args:
-            base_url: The base URL of the OpenProject instance
-            api_key: API key for authentication
-            proxy: Optional HTTP proxy URL
-        """
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.proxy = proxy
-
-        # Setup headers with Basic Auth
         self.headers = {
             "Authorization": f"Basic {self._encode_api_key()}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": f"OpenProject-MCP/{__version__}",
         }
-
         logger.info(f"OpenProject Client initialized for: {self.base_url}")
         if self.proxy:
             logger.info(f"Using proxy: {self.proxy}")
 
     def _encode_api_key(self) -> str:
-        """Encode API key for Basic Auth"""
         credentials = f"apikey:{self.api_key}"
         return base64.b64encode(credentials.encode()).decode()
 
     async def _request(
         self, method: str, endpoint: str, data: Optional[Dict] = None
     ) -> Dict:
-        """
-        Execute an API request.
-
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            endpoint: API endpoint path
-            data: Optional request body data
-
-        Returns:
-            Dict: Response data from the API
-
-        Raises:
-            Exception: If the request fails
-        """
         url = f"{self.base_url}/api/v3{endpoint}"
-
         logger.debug(f"API Request: {method} {url}")
         if data:
             logger.debug(f"Request body: {json.dumps(data, indent=2)}")
 
-        # Configure SSL and timeout
         ssl_context = ssl.create_default_context()
         connector = aiohttp.TCPConnector(ssl=ssl_context)
         timeout = aiohttp.ClientTimeout(total=30)
@@ -106,38 +95,33 @@ class OpenProjectClient:
             connector=connector, timeout=timeout
         ) as session:
             try:
-                # Build request parameters
                 request_params = {
                     "method": method,
                     "url": url,
                     "headers": self.headers,
                     "json": data,
                 }
-
-                # Add proxy if configured
                 if self.proxy:
                     request_params["proxy"] = self.proxy
 
                 async with session.request(**request_params) as response:
                     response_text = await response.text()
-
                     logger.debug(f"Response status: {response.status}")
 
-                    # Parse response
                     try:
                         response_json = (
                             json.loads(response_text) if response_text else {}
                         )
                     except json.JSONDecodeError:
-                        logger.error(f"Invalid JSON response: {response_text[:200]}...")
+                        logger.error(
+                            f"Invalid JSON response: {response_text[:200]}..."
+                        )
                         response_json = {}
 
-                    # Handle errors
                     if response.status >= 400:
-                        error_msg = self._format_error_message(
-                            response.status, response_text
+                        raise Exception(
+                            self._format_error(response.status, response_text)
                         )
-                        raise Exception(error_msg)
 
                     return response_json
 
@@ -145,416 +129,144 @@ class OpenProjectClient:
                 logger.error(f"Network error: {str(e)}")
                 raise Exception(f"Network error accessing {url}: {str(e)}")
 
-    def _format_error_message(self, status: int, response_text: str) -> str:
-        """Format error message based on HTTP status code"""
-        base_msg = f"API Error {status}: {response_text}"
-
-        error_hints = {
-            401: "Authentication failed. Please check your API key.",
-            403: "Access denied. The user lacks required permissions.",
-            404: "Resource not found. Please verify the URL and resource exists.",
+    def _format_error(self, status: int, response_text: str) -> str:
+        hints = {
+            401: "Authentication failed. Check API key.",
+            403: "Access denied. User lacks permissions.",
+            404: "Resource not found.",
             407: "Proxy authentication required.",
-            500: "Internal server error. Please try again later.",
-            502: "Bad gateway. The server or proxy is not responding correctly.",
-            503: "Service unavailable. The server might be under maintenance.",
+            422: "Validation error.",
+            500: "Internal server error.",
+            502: "Bad gateway.",
+            503: "Service unavailable.",
         }
+        msg = f"API Error {status}: {response_text}"
+        if status in hints:
+            msg += f"\n\n{hints[status]}"
+        return msg
 
-        if status in error_hints:
-            base_msg += f"\n\n{error_hints[status]}"
+    # ── Generic helpers ──────────────────────────────────────────────
 
-        return base_msg
+    async def get(self, endpoint: str) -> Dict:
+        return await self._request("GET", endpoint)
 
-    async def test_connection(self) -> Dict:
-        """Test the API connection and authentication"""
-        logger.info("Testing API connection...")
-        return await self._request("GET", "")
+    async def post(self, endpoint: str, data: Optional[Dict] = None) -> Dict:
+        return await self._request("POST", endpoint, data)
 
-    async def get_projects(self, filters: Optional[str] = None) -> Dict:
-        """
-        Retrieve all projects.
+    async def patch(self, endpoint: str, data: Optional[Dict] = None) -> Dict:
+        return await self._request("PATCH", endpoint, data)
 
-        Args:
-            filters: Optional JSON-encoded filter string
+    async def delete_resource(self, endpoint: str) -> bool:
+        await self._request("DELETE", endpoint)
+        return True
 
-        Returns:
-            Dict: API response containing projects
-        """
-        endpoint = "/projects"
-        if filters:
-            encoded_filters = quote(filters)
-            endpoint += f"?filters={encoded_filters}"
+    async def post_text(self, endpoint: str, text: str, content_type: str = "text/plain") -> Dict:
+        """POST raw text body (e.g. for /render/markdown)."""
+        url = f"{self.base_url}/api/v3{endpoint}"
+        headers = {**self.headers, "Content-Type": content_type}
+        ssl_context = ssl.create_default_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            request_params = {"method": "POST", "url": url, "headers": headers, "data": text.encode("utf-8")}
+            if self.proxy:
+                request_params["proxy"] = self.proxy
+            async with session.request(**request_params) as response:
+                response_text = await response.text()
+                if response.status >= 400:
+                    raise Exception(self._format_error(response.status, response_text))
+                return {"html": response_text}
 
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
+    def _ensure_collection(self, result: Dict) -> List[Dict]:
+        """Extract elements list from a collection response."""
         if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
+            return []
+        return result.get("_embedded", {}).get("elements", [])
 
-        return result
-
-    async def get_work_packages(
-        self,
-        project_id: Optional[int] = None,
-        filters: Optional[str] = None,
-        offset: Optional[int] = None,
-        page_size: Optional[int] = None,
-    ) -> Dict:
-        """
-        Retrieve work packages.
-
-        Args:
-            project_id: Optional project ID to filter by
-            filters: Optional JSON-encoded filter string
-            offset: Optional starting index for pagination
-            page_size: Optional number of results per page
-
-        Returns:
-            Dict: API response containing work packages
-        """
-        if project_id:
-            endpoint = f"/projects/{project_id}/work_packages"
-        else:
-            endpoint = "/work_packages"
-
-        # Build query parameters
-        query_params = []
-        if filters:
-            encoded_filters = quote(filters)
-            query_params.append(f"filters={encoded_filters}")
-        if offset is not None:
-            query_params.append(f"offset={offset}")
-        if page_size is not None:
-            query_params.append(f"pageSize={page_size}")
-
-        if query_params:
-            endpoint += "?" + "&".join(query_params)
-
+    async def get_collection(self, endpoint: str) -> List[Dict]:
+        """GET a collection endpoint and return elements list."""
         result = await self._request("GET", endpoint)
+        return self._ensure_collection(result)
 
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
+    # ── Complex operations (form/lock-version logic) ─────────────────
 
     async def create_work_package(self, data: Dict) -> Dict:
-        """
-        Create a new work package.
-
-        Args:
-            data: Work package data including project, subject, type, etc.
-
-        Returns:
-            Dict: Created work package data
-        """
-        # Prepare initial payload for form
         form_payload = {"_links": {}}
-
-        # Set required links
         if "project" in data:
             form_payload["_links"]["project"] = {
                 "href": f"/api/v3/projects/{data['project']}"
             }
         if "type" in data:
-            form_payload["_links"]["type"] = {"href": f"/api/v3/types/{data['type']}"}
-
-        # Set subject if provided
+            form_payload["_links"]["type"] = {
+                "href": f"/api/v3/types/{data['type']}"
+            }
         if "subject" in data:
             form_payload["subject"] = data["subject"]
 
-        # Get form with initial payload
         form = await self._request("POST", "/work_packages/form", form_payload)
-
-        # Use form payload and add additional fields
         payload = form.get("payload", form_payload)
         payload["lockVersion"] = form.get("lockVersion", 0)
 
-        # Add optional fields
         if "description" in data:
             payload["description"] = {"raw": data["description"]}
         if "priority_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["priority"] = {
+            payload.setdefault("_links", {})["priority"] = {
                 "href": f"/api/v3/priorities/{data['priority_id']}"
             }
         if "assignee_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["assignee"] = {
+            payload.setdefault("_links", {})["assignee"] = {
                 "href": f"/api/v3/users/{data['assignee_id']}"
             }
-
-        # Add date fields (ISO 8601 format: YYYY-MM-DD)
-        if "startDate" in data:
-            payload["startDate"] = data["startDate"]
-        if "dueDate" in data:
-            payload["dueDate"] = data["dueDate"]
-        if "date" in data:
-            payload["date"] = data["date"]
-
-        # Create work package
+        for f in ("startDate", "dueDate", "date"):
+            if f in data:
+                payload[f] = data[f]
         return await self._request("POST", "/work_packages", payload)
 
-    async def get_types(self, project_id: Optional[int] = None) -> Dict:
-        """
-        Retrieve available work package types.
+    async def update_work_package(self, wp_id: int, data: Dict) -> Dict:
+        current = await self._request("GET", f"/work_packages/{wp_id}")
+        payload = {"lockVersion": current.get("lockVersion", 0)}
 
-        Args:
-            project_id: Optional project ID to filter types by
-
-        Returns:
-            Dict: API response containing types
-        """
-        if project_id:
-            endpoint = f"/projects/{project_id}/types"
-        else:
-            endpoint = "/types"
-
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_users(self, filters: Optional[str] = None) -> Dict:
-        """
-        Retrieve users.
-
-        Args:
-            filters: Optional JSON-encoded filter string
-
-        Returns:
-            Dict: API response containing users
-        """
-        endpoint = "/users"
-        if filters:
-            encoded_filters = quote(filters)
-            endpoint += f"?filters={encoded_filters}"
-
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_user(self, user_id: int) -> Dict:
-        """
-        Retrieve a specific user by ID.
-
-        Args:
-            user_id: The user ID
-
-        Returns:
-            Dict: User data
-        """
-        return await self._request("GET", f"/users/{user_id}")
-
-    async def get_memberships(
-        self, project_id: Optional[int] = None, user_id: Optional[int] = None
-    ) -> Dict:
-        """
-        Retrieve memberships.
-
-        Args:
-            project_id: Optional project ID to filter memberships by project
-            user_id: Optional user ID to filter memberships by user
-
-        Returns:
-            Dict: API response containing memberships
-        """
-        endpoint = "/memberships"
-
-        # Use filters instead of path-based filtering for better compatibility
-        filters = []
-        if project_id:
-            filters.append({"project": {"operator": "=", "values": [str(project_id)]}})
-        if user_id:
-            filters.append({"user": {"operator": "=", "values": [str(user_id)]}})
-
-        if filters:
-            filter_string = quote(json.dumps(filters))
-            endpoint += f"?filters={filter_string}"
-
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_statuses(self) -> Dict:
-        """
-        Retrieve available work package statuses.
-
-        Returns:
-            Dict: API response containing statuses
-        """
-        result = await self._request("GET", "/statuses")
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_priorities(self) -> Dict:
-        """
-        Retrieve available work package priorities.
-
-        Returns:
-            Dict: API response containing priorities
-        """
-        result = await self._request("GET", "/priorities")
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_work_package(self, work_package_id: int) -> Dict:
-        """
-        Retrieve a specific work package by ID.
-
-        Args:
-            work_package_id: The work package ID
-
-        Returns:
-            Dict: Work package data
-        """
-        return await self._request("GET", f"/work_packages/{work_package_id}")
-
-    async def update_work_package(self, work_package_id: int, data: Dict) -> Dict:
-        """
-        Update an existing work package.
-
-        Args:
-            work_package_id: The work package ID
-            data: Update data including fields to modify
-
-        Returns:
-            Dict: Updated work package data
-        """
-        # First get current work package to get lock version
-        current_wp = await self.get_work_package(work_package_id)
-
-        # Prepare payload with lock version
-        payload = {"lockVersion": current_wp.get("lockVersion", 0)}
-
-        # Add fields to update
         if "subject" in data:
             payload["subject"] = data["subject"]
         if "description" in data:
             payload["description"] = {"raw": data["description"]}
-        if "type_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["type"] = {"href": f"/api/v3/types/{data['type_id']}"}
-        if "status_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["status"] = {
-                "href": f"/api/v3/statuses/{data['status_id']}"
-            }
-        if "priority_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["priority"] = {
-                "href": f"/api/v3/priorities/{data['priority_id']}"
-            }
-        if "assignee_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["assignee"] = {
-                "href": f"/api/v3/users/{data['assignee_id']}"
-            }
+
+        link_map = {
+            "type_id": ("type", "/api/v3/types/{}"),
+            "status_id": ("status", "/api/v3/statuses/{}"),
+            "priority_id": ("priority", "/api/v3/priorities/{}"),
+            "assignee_id": ("assignee", "/api/v3/users/{}"),
+        }
+        for key, (link_name, href_tpl) in link_map.items():
+            if key in data:
+                payload.setdefault("_links", {})[link_name] = {
+                    "href": href_tpl.format(data[key])
+                }
         if "percentage_done" in data:
             payload["percentageDone"] = data["percentage_done"]
+        for f in ("startDate", "dueDate", "date"):
+            if f in data:
+                payload[f] = data[f]
+        return await self._request("PATCH", f"/work_packages/{wp_id}", payload)
 
-        # Add date fields (ISO 8601 format: YYYY-MM-DD)
-        if "startDate" in data:
-            payload["startDate"] = data["startDate"]
-        if "dueDate" in data:
-            payload["dueDate"] = data["dueDate"]
-        if "date" in data:
-            payload["date"] = data["date"]
+    async def set_work_package_parent(self, wp_id: int, parent_id: int) -> Dict:
+        current = await self._request("GET", f"/work_packages/{wp_id}")
+        payload = {
+            "lockVersion": current.get("lockVersion", 0),
+            "_links": {"parent": {"href": f"/api/v3/work_packages/{parent_id}"}},
+        }
+        return await self._request("PATCH", f"/work_packages/{wp_id}", payload)
 
-        return await self._request(
-            "PATCH", f"/work_packages/{work_package_id}", payload
-        )
-
-    async def delete_work_package(self, work_package_id: int) -> bool:
-        """
-        Delete a work package.
-
-        Args:
-            work_package_id: The work package ID
-
-        Returns:
-            bool: True if successful
-        """
-        await self._request("DELETE", f"/work_packages/{work_package_id}")
-        return True
-
-    async def get_time_entries(self, filters: Optional[str] = None) -> Dict:
-        """
-        Retrieve time entries.
-
-        Args:
-            filters: Optional JSON-encoded filter string
-
-        Returns:
-            Dict: API response containing time entries
-        """
-        endpoint = "/time_entries"
-        if filters:
-            encoded_filters = quote(filters)
-            endpoint += f"?filters={encoded_filters}"
-
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
+    async def remove_work_package_parent(self, wp_id: int) -> Dict:
+        current = await self._request("GET", f"/work_packages/{wp_id}")
+        payload = {
+            "lockVersion": current.get("lockVersion", 0),
+            "_links": {"parent": None},
+        }
+        return await self._request("PATCH", f"/work_packages/{wp_id}", payload)
 
     async def create_time_entry(self, data: Dict) -> Dict:
-        """
-        Create a new time entry.
-
-        Args:
-            data: Time entry data including work package, hours, etc.
-
-        Returns:
-            Dict: Created time entry data
-        """
-        # Prepare payload
         payload = {}
-
-        # Set required fields
         if "work_package_id" in data:
             payload["_links"] = {
                 "workPackage": {
@@ -568,32 +280,14 @@ class OpenProjectClient:
         if "comment" in data:
             payload["comment"] = {"raw": data["comment"]}
         if "activity_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["activity"] = {
+            payload.setdefault("_links", {})["activity"] = {
                 "href": f"/api/v3/time_entries/activities/{data['activity_id']}"
             }
-
         return await self._request("POST", "/time_entries", payload)
 
-    async def update_time_entry(self, time_entry_id: int, data: Dict) -> Dict:
-        """
-        Update an existing time entry.
-
-        Args:
-            time_entry_id: The time entry ID
-            data: Update data including fields to modify
-
-        Returns:
-            Dict: Updated time entry data
-        """
-        # First get current time entry to get lock version
-        current_te = await self._request("GET", f"/time_entries/{time_entry_id}")
-
-        # Prepare payload with lock version
-        payload = {"lockVersion": current_te.get("lockVersion", 0)}
-
-        # Add fields to update
+    async def update_time_entry(self, te_id: int, data: Dict) -> Dict:
+        current = await self._request("GET", f"/time_entries/{te_id}")
+        payload = {"lockVersion": current.get("lockVersion", 0)}
         if "hours" in data:
             payload["hours"] = f"PT{data['hours']}H"
         if "spent_on" in data:
@@ -601,255 +295,13 @@ class OpenProjectClient:
         if "comment" in data:
             payload["comment"] = {"raw": data["comment"]}
         if "activity_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["activity"] = {
+            payload.setdefault("_links", {})["activity"] = {
                 "href": f"/api/v3/time_entries/activities/{data['activity_id']}"
             }
-
-        return await self._request("PATCH", f"/time_entries/{time_entry_id}", payload)
-
-    async def delete_time_entry(self, time_entry_id: int) -> bool:
-        """
-        Delete a time entry.
-
-        Args:
-            time_entry_id: The time entry ID
-
-        Returns:
-            bool: True if successful
-        """
-        await self._request("DELETE", f"/time_entries/{time_entry_id}")
-        return True
-
-    async def get_time_entry_activities(self) -> Dict:
-        """
-        Retrieve available time entry activities.
-
-        Returns:
-            Dict: API response containing activities
-        """
-        result = await self._request("GET", "/time_entries/activities")
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_versions(self, project_id: Optional[int] = None) -> Dict:
-        """
-        Retrieve project versions.
-
-        Args:
-            project_id: Optional project ID to filter versions by project
-
-        Returns:
-            Dict: API response containing versions
-        """
-        if project_id:
-            endpoint = f"/projects/{project_id}/versions"
-        else:
-            endpoint = "/versions"
-
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def create_version(self, project_id: int, data: Dict) -> Dict:
-        """
-        Create a new project version.
-
-        Args:
-            project_id: The project ID
-            data: Version data including name, description, etc.
-
-        Returns:
-            Dict: Created version data
-        """
-        # Prepare payload
-        payload = {
-            "_links": {"definingProject": {"href": f"/api/v3/projects/{project_id}"}}
-        }
-
-        # Set required fields
-        if "name" in data:
-            payload["name"] = data["name"]
-        if "description" in data:
-            payload["description"] = {"raw": data["description"]}
-        if "start_date" in data:
-            payload["startDate"] = data["start_date"]
-        if "end_date" in data:
-            payload["endDate"] = data["end_date"]
-        if "status" in data:
-            payload["status"] = data["status"]
-
-        return await self._request("POST", "/versions", payload)
-
-    async def check_permissions(self) -> Dict:
-        """
-        Check user permissions and capabilities.
-
-        Returns:
-            Dict: User information including permissions
-        """
-        try:
-            # Get current user info which includes permissions
-            return await self._request("GET", "/users/me")
-        except Exception as e:
-            logger.error(f"Failed to check permissions: {e}")
-            return {}
-
-    async def create_project(self, data: Dict) -> Dict:
-        """
-        Create a new project.
-
-        Args:
-            data: Project data including name, identifier, description, etc.
-
-        Returns:
-            Dict: Created project data
-        """
-        # Prepare payload
-        payload = {}
-
-        # Set required fields
-        if "name" in data:
-            payload["name"] = data["name"]
-        if "identifier" in data:
-            payload["identifier"] = data["identifier"]
-        if "description" in data:
-            payload["description"] = {"raw": data["description"]}
-        if "public" in data:
-            payload["public"] = data["public"]
-        if "status" in data:
-            payload["status"] = data["status"]
-        if "parent_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["parent"] = {
-                "href": f"/api/v3/projects/{data['parent_id']}"
-            }
-
-        return await self._request("POST", "/projects", payload)
-
-    async def update_project(self, project_id: int, data: Dict) -> Dict:
-        """
-        Update an existing project.
-
-        Args:
-            project_id: The project ID
-            data: Update data including fields to modify
-
-        Returns:
-            Dict: Updated project data
-        """
-        # First get current project to get lock version if needed
-        try:
-            current_project = await self.get_project(project_id)
-            lock_version = current_project.get("lockVersion", 0)
-        except:
-            lock_version = 0
-
-        # Prepare payload with lock version
-        payload = {"lockVersion": lock_version}
-
-        # Add fields to update
-        if "name" in data:
-            payload["name"] = data["name"]
-        if "identifier" in data:
-            payload["identifier"] = data["identifier"]
-        if "description" in data:
-            payload["description"] = {"raw": data["description"]}
-        if "public" in data:
-            payload["public"] = data["public"]
-        if "status" in data:
-            payload["status"] = data["status"]
-        if "parent_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["parent"] = {
-                "href": f"/api/v3/projects/{data['parent_id']}"
-            }
-
-        return await self._request("PATCH", f"/projects/{project_id}", payload)
-
-    async def delete_project(self, project_id: int) -> bool:
-        """
-        Delete a project.
-
-        Args:
-            project_id: The project ID
-
-        Returns:
-            bool: True if successful
-        """
-        await self._request("DELETE", f"/projects/{project_id}")
-        return True
-
-    async def get_project(self, project_id: int) -> Dict:
-        """
-        Retrieve a specific project by ID.
-
-        Args:
-            project_id: The project ID
-
-        Returns:
-            Dict: Project data
-        """
-        return await self._request("GET", f"/projects/{project_id}")
-
-    async def get_roles(self) -> Dict:
-        """
-        Retrieve available roles.
-
-        Returns:
-            Dict: API response containing roles
-        """
-        result = await self._request("GET", "/roles")
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def get_role(self, role_id: int) -> Dict:
-        """
-        Retrieve a specific role by ID.
-
-        Args:
-            role_id: The role ID
-
-        Returns:
-            Dict: Role data
-        """
-        return await self._request("GET", f"/roles/{role_id}")
+        return await self._request("PATCH", f"/time_entries/{te_id}", payload)
 
     async def create_membership(self, data: Dict) -> Dict:
-        """
-        Create a new membership.
-
-        Args:
-            data: Membership data including project, user/group, and roles
-
-        Returns:
-            Dict: Created membership data
-        """
-        # Prepare payload
         payload = {"_links": {}}
-
-        # Set required fields
         if "project_id" in data:
             payload["_links"]["project"] = {
                 "href": f"/api/v3/projects/{data['project_id']}"
@@ -864,279 +316,2698 @@ class OpenProjectClient:
             }
         if "role_ids" in data:
             payload["_links"]["roles"] = [
-                {"href": f"/api/v3/roles/{role_id}"} for role_id in data["role_ids"]
+                {"href": f"/api/v3/roles/{r}"} for r in data["role_ids"]
             ]
         elif "role_id" in data:
-            payload["_links"]["roles"] = [{"href": f"/api/v3/roles/{data['role_id']}"}]
+            payload["_links"]["roles"] = [
+                {"href": f"/api/v3/roles/{data['role_id']}"}
+            ]
         if "notification_message" in data:
             payload["notificationMessage"] = {"raw": data["notification_message"]}
-
         return await self._request("POST", "/memberships", payload)
 
-    async def update_membership(self, membership_id: int, data: Dict) -> Dict:
-        """
-        Update an existing membership.
-
-        Args:
-            membership_id: The membership ID
-            data: Update data including fields to modify
-
-        Returns:
-            Dict: Updated membership data
-        """
-        # First get current membership to get lock version if needed
-        try:
-            current_membership = await self.get_membership(membership_id)
-            lock_version = current_membership.get("lockVersion", 0)
-        except:
-            lock_version = 0
-
-        # Prepare payload with lock version
-        payload = {"lockVersion": lock_version}
-
-        # Add fields to update
+    async def update_membership(self, mem_id: int, data: Dict) -> Dict:
+        current = await self._request("GET", f"/memberships/{mem_id}")
+        payload = {"lockVersion": current.get("lockVersion", 0)}
         if "role_ids" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["roles"] = [
-                {"href": f"/api/v3/roles/{role_id}"} for role_id in data["role_ids"]
+            payload.setdefault("_links", {})["roles"] = [
+                {"href": f"/api/v3/roles/{r}"} for r in data["role_ids"]
             ]
         elif "role_id" in data:
-            if "_links" not in payload:
-                payload["_links"] = {}
-            payload["_links"]["roles"] = [{"href": f"/api/v3/roles/{data['role_id']}"}]
+            payload.setdefault("_links", {})["roles"] = [
+                {"href": f"/api/v3/roles/{data['role_id']}"}
+            ]
         if "notification_message" in data:
             payload["notificationMessage"] = {"raw": data["notification_message"]}
+        return await self._request("PATCH", f"/memberships/{mem_id}", payload)
 
-        return await self._request("PATCH", f"/memberships/{membership_id}", payload)
+    async def create_project(self, data: Dict) -> Dict:
+        payload = {}
+        for f in ("name", "identifier"):
+            if f in data:
+                payload[f] = data[f]
+        if "description" in data:
+            payload["description"] = {"raw": data["description"]}
+        if "public" in data:
+            payload["public"] = data["public"]
+        if "status" in data:
+            payload["status"] = data["status"]
+        if "parent_id" in data:
+            payload.setdefault("_links", {})["parent"] = {
+                "href": f"/api/v3/projects/{data['parent_id']}"
+            }
+        return await self._request("POST", "/projects", payload)
 
-    async def delete_membership(self, membership_id: int) -> bool:
-        """
-        Delete a membership.
-
-        Args:
-            membership_id: The membership ID
-
-        Returns:
-            bool: True if successful
-        """
-        await self._request("DELETE", f"/memberships/{membership_id}")
-        return True
-
-    async def get_membership(self, membership_id: int) -> Dict:
-        """
-        Retrieve a specific membership by ID.
-
-        Args:
-            membership_id: The membership ID
-
-        Returns:
-            Dict: Membership data
-        """
-        return await self._request("GET", f"/memberships/{membership_id}")
-
-    async def set_work_package_parent(
-        self, work_package_id: int, parent_id: int
-    ) -> Dict:
-        """
-        Set a parent for a work package (create parent-child relationship).
-
-        Args:
-            work_package_id: The work package ID to become a child
-            parent_id: The work package ID to become the parent
-
-        Returns:
-            Dict: Updated work package data
-        """
-        # First get current work package to get lock version
+    async def update_project(self, project_id: int, data: Dict) -> Dict:
         try:
-            current_wp = await self.get_work_package(work_package_id)
-            lock_version = current_wp.get("lockVersion", 0)
-        except:
+            current = await self._request("GET", f"/projects/{project_id}")
+            lock_version = current.get("lockVersion", 0)
+        except Exception:
             lock_version = 0
+        payload = {"lockVersion": lock_version}
+        for f in ("name", "identifier"):
+            if f in data:
+                payload[f] = data[f]
+        if "description" in data:
+            payload["description"] = {"raw": data["description"]}
+        if "public" in data:
+            payload["public"] = data["public"]
+        if "status" in data:
+            payload["status"] = data["status"]
+        if "parent_id" in data:
+            payload.setdefault("_links", {})["parent"] = {
+                "href": f"/api/v3/projects/{data['parent_id']}"
+            }
+        return await self._request("PATCH", f"/projects/{project_id}", payload)
 
-        # Prepare payload with parent link
+    async def create_version(self, project_id: int, data: Dict) -> Dict:
         payload = {
-            "lockVersion": lock_version,
-            "_links": {"parent": {"href": f"/api/v3/work_packages/{parent_id}"}},
+            "_links": {
+                "definingProject": {"href": f"/api/v3/projects/{project_id}"}
+            }
         }
+        if "name" in data:
+            payload["name"] = data["name"]
+        if "description" in data:
+            payload["description"] = {"raw": data["description"]}
+        if "start_date" in data:
+            payload["startDate"] = data["start_date"]
+        if "end_date" in data:
+            payload["endDate"] = data["end_date"]
+        if "status" in data:
+            payload["status"] = data["status"]
+        return await self._request("POST", "/versions", payload)
 
-        return await self._request(
-            "PATCH", f"/work_packages/{work_package_id}", payload
-        )
+    async def update_version(self, version_id: int, data: Dict) -> Dict:
+        current = await self._request("GET", f"/versions/{version_id}")
+        payload = {"lockVersion": current.get("lockVersion", 0)}
+        for f in ("name", "status"):
+            if f in data:
+                payload[f] = data[f]
+        if "description" in data:
+            payload["description"] = {"raw": data["description"]}
+        if "start_date" in data:
+            payload["startDate"] = data["start_date"]
+        if "end_date" in data:
+            payload["endDate"] = data["end_date"]
+        return await self._request("PATCH", f"/versions/{version_id}", payload)
 
-    async def remove_work_package_parent(self, work_package_id: int) -> Dict:
-        """
-        Remove parent relationship from a work package (make it top-level).
-
-        Args:
-            work_package_id: The work package ID to remove parent from
-
-        Returns:
-            Dict: Updated work package data
-        """
-        # First get current work package to get lock version
-        try:
-            current_wp = await self.get_work_package(work_package_id)
-            lock_version = current_wp.get("lockVersion", 0)
-        except:
-            lock_version = 0
-
-        # Prepare payload with null parent link
-        payload = {"lockVersion": lock_version, "_links": {"parent": None}}
-
-        return await self._request(
-            "PATCH", f"/work_packages/{work_package_id}", payload
-        )
-
-    async def list_work_package_children(
-        self, parent_id: int, include_descendants: bool = False
-    ) -> Dict:
-        """
-        List all child work packages of a parent.
-
-        Args:
-            parent_id: The parent work package ID
-            include_descendants: If True, includes grandchildren and below
-
-        Returns:
-            Dict: API response containing child work packages
-        """
-        if include_descendants:
-            # Use descendants filter to get all levels
-            filters = json.dumps(
-                [{"descendantsOf": {"operator": "=", "values": [str(parent_id)]}}]
-            )
-        else:
-            # Use parent filter to get direct children only
-            filters = json.dumps(
-                [{"parent": {"operator": "=", "values": [str(parent_id)]}}]
-            )
-
-        endpoint = f"/work_packages?filters={quote(filters)}"
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def create_work_package_relation(self, data: Dict) -> Dict:
-        """
-        Create a relationship between work packages.
-
-        Args:
-            data: Relation data including from_id, to_id, relation_type, lag
-
-        Returns:
-            Dict: Created relation data
-        """
-        # Prepare payload
+    async def create_relation(self, data: Dict) -> Dict:
         payload = {"_links": {}}
-
-        # Set required fields
         if "from_id" in data:
             payload["_links"]["from"] = {
                 "href": f"/api/v3/work_packages/{data['from_id']}"
             }
         if "to_id" in data:
-            payload["_links"]["to"] = {"href": f"/api/v3/work_packages/{data['to_id']}"}
+            payload["_links"]["to"] = {
+                "href": f"/api/v3/work_packages/{data['to_id']}"
+            }
         if "relation_type" in data:
             payload["type"] = data["relation_type"]
-        if "lag" in data:
-            payload["lag"] = data["lag"]
-        if "description" in data:
-            payload["description"] = data["description"]
+        for f in ("lag", "description"):
+            if f in data:
+                payload[f] = data[f]
+        from_id = data.get("from_id")
+        return await self._request(
+            "POST", f"/work_packages/{from_id}/relations", payload
+        )
 
-        return await self._request("POST", "/relations", payload)
-
-    async def list_work_package_relations(self, filters: Optional[str] = None) -> Dict:
-        """
-        List work package relations.
-
-        Args:
-            filters: Optional JSON-encoded filter string
-
-        Returns:
-            Dict: API response containing relations
-        """
-        endpoint = "/relations"
-        if filters:
-            encoded_filters = quote(filters)
-            endpoint += f"?filters={encoded_filters}"
-
-        result = await self._request("GET", endpoint)
-
-        # Ensure proper response structure
-        if "_embedded" not in result:
-            result["_embedded"] = {"elements": []}
-        elif "elements" not in result.get("_embedded", {}):
-            result["_embedded"]["elements"] = []
-
-        return result
-
-    async def update_work_package_relation(self, relation_id: int, data: Dict) -> Dict:
-        """
-        Update an existing work package relation.
-
-        Args:
-            relation_id: The relation ID
-            data: Update data including fields to modify
-
-        Returns:
-            Dict: Updated relation data
-        """
-        # First get current relation to get lock version if needed
-        try:
-            current_relation = await self.get_work_package_relation(relation_id)
-            lock_version = current_relation.get("lockVersion", 0)
-        except:
-            lock_version = 0
-
-        # Prepare payload with lock version
-        payload = {"lockVersion": lock_version}
-
-        # Add fields to update
+    async def update_relation(self, relation_id: int, data: Dict) -> Dict:
+        current = await self._request("GET", f"/relations/{relation_id}")
+        payload = {"lockVersion": current.get("lockVersion", 0)}
         if "relation_type" in data:
             payload["type"] = data["relation_type"]
-        if "lag" in data:
-            payload["lag"] = data["lag"]
-        if "description" in data:
-            payload["description"] = data["description"]
-
+        for f in ("lag", "description"):
+            if f in data:
+                payload[f] = data[f]
         return await self._request("PATCH", f"/relations/{relation_id}", payload)
 
-    async def delete_work_package_relation(self, relation_id: int) -> bool:
-        """
-        Delete a work package relation.
 
-        Args:
-            relation_id: The relation ID
+# ═══════════════════════════════════════════════════════════════════════
+# Handler Functions — organized by tool
+# Each handler: async def handler(client, args) -> str
+# ═══════════════════════════════════════════════════════════════════════
 
-        Returns:
-            bool: True if successful
-        """
-        await self._request("DELETE", f"/relations/{relation_id}")
-        return True
 
-    async def get_work_package_relation(self, relation_id: int) -> Dict:
-        """
-        Retrieve a specific work package relation by ID.
+# ── project handlers ─────────────────────────────────────────────────
 
-        Args:
-            relation_id: The relation ID
 
-        Returns:
-            Dict: Relation data
-        """
-        return await self._request("GET", f"/relations/{relation_id}")
+async def h_project_list(client, args):
+    filters = None
+    if args.get("active_only", True):
+        filters = json.dumps([{"active": {"operator": "=", "values": ["t"]}}])
+    endpoint = "/projects?pageSize=100"
+    if filters:
+        endpoint += f"&filters={quote(filters)}"
+    result = await client.get(endpoint)
+    projects = client._ensure_collection(result)
+    if not projects:
+        return "No projects found."
+    text = f"Found {len(projects)} project(s):\n\n"
+    for p in projects:
+        text += f"- **{p['name']}** (ID: {p['id']})\n"
+        desc = (p.get("description") or {}).get("raw")
+        if desc:
+            text += f"  {desc}\n"
+        text += f"  Status: {'Active' if p.get('active') else 'Inactive'} | Public: {'Yes' if p.get('public') else 'No'}\n\n"
+    return text
+
+
+async def h_project_get(client, args):
+    r = await client.get(f"/projects/{args['project_id']}")
+    desc = (r.get("description") or {}).get("raw", "No description")
+    return (
+        f"**Project Details:**\n\n"
+        f"- **Name**: {r.get('name', 'N/A')}\n"
+        f"- **ID**: #{r.get('id', 'N/A')}\n"
+        f"- **Identifier**: {r.get('identifier', 'N/A')}\n"
+        f"- **Description**: {desc}\n"
+        f"- **Public**: {'Yes' if r.get('public') else 'No'}\n"
+        f"- **Status**: {r.get('status', 'N/A')}\n"
+        f"- **Created**: {r.get('createdAt', 'N/A')}\n"
+        f"- **Updated**: {r.get('updatedAt', 'N/A')}\n"
+    )
+
+
+async def h_project_create(client, args):
+    data = {"name": args["name"], "identifier": args["identifier"]}
+    for f in ("description", "public", "status", "parent_id"):
+        if f in args:
+            data[f] = args[f]
+    r = await client.create_project(data)
+    return (
+        f"✅ Project created successfully:\n\n"
+        f"- **Name**: {r.get('name')}\n"
+        f"- **ID**: #{r.get('id')}\n"
+        f"- **Identifier**: {r.get('identifier')}\n"
+        f"- **Public**: {'Yes' if r.get('public') else 'No'}\n"
+    )
+
+
+async def h_project_update(client, args):
+    pid = args["project_id"]
+    data = {
+        k: args[k]
+        for k in ("name", "identifier", "description", "public", "status", "parent_id")
+        if k in args
+    }
+    if not data:
+        return "❌ No fields provided to update."
+    r = await client.update_project(pid, data)
+    return (
+        f"✅ Project #{pid} updated:\n"
+        f"- **Name**: {r.get('name')}\n"
+        f"- **Identifier**: {r.get('identifier')}\n"
+        f"- **Status**: {r.get('status')}\n"
+    )
+
+
+async def h_project_delete(client, args):
+    await client.delete_resource(f"/projects/{args['project_id']}")
+    return f"✅ Project #{args['project_id']} deleted."
+
+
+async def h_project_list_types(client, args):
+    pid = args.get("project_id")
+    endpoint = f"/projects/{pid}/types" if pid else "/types"
+    items = await client.get_collection(endpoint)
+    if not items:
+        return "No work package types found."
+    text = "Available work package types:\n\n"
+    for t in items:
+        text += f"- **{t.get('name')}** (ID: {t.get('id')})"
+        if t.get("isDefault"):
+            text += " ✓Default"
+        if t.get("isMilestone"):
+            text += " ✓Milestone"
+        text += "\n"
+    return text
+
+
+async def h_project_list_versions(client, args):
+    pid = args.get("project_id")
+    endpoint = (
+        f"/projects/{pid}/versions?pageSize=100"
+        if pid
+        else "/versions?pageSize=100"
+    )
+    result = await client.get(endpoint)
+    versions = client._ensure_collection(result)
+    if not versions:
+        return "No versions found."
+    text = f"Found {len(versions)} version(s):\n\n"
+    for v in versions:
+        text += f"- **{v.get('name')}** (ID: {v.get('id')})\n"
+        text += f"  Status: {v.get('status', 'Unknown')}"
+        if v.get("startDate"):
+            text += f" | Start: {v['startDate']}"
+        if v.get("endDate"):
+            text += f" | End: {v['endDate']}"
+        text += "\n"
+    return text
+
+
+async def h_project_list_available_assignees(client, args):
+    items = await client.get_collection(
+        f"/projects/{args['project_id']}/available_assignees"
+    )
+    if not items:
+        return "No available assignees."
+    text = "Available assignees:\n\n"
+    for u in items:
+        text += f"- **{u.get('name')}** (ID: {u.get('id')})\n"
+    return text
+
+
+async def h_project_copy(client, args):
+    r = await client.post(
+        f"/projects/{args['source_project_id']}/copy", args.get("payload", {})
+    )
+    return f"✅ Project copy initiated. New project ID: #{r.get('id', 'pending')}"
+
+
+# ── work_package handlers ────────────────────────────────────────────
+
+
+async def h_wp_list(client, args):
+    pid = args.get("project_id")
+    status = args.get("status", "open")
+    offset = args.get("offset")
+    page_size = args.get("page_size")
+
+    base = f"/projects/{pid}/work_packages" if pid else "/work_packages"
+    params = []
+    if status == "open":
+        f = json.dumps([{"status_id": {"operator": "o", "values": None}}])
+        params.append(f"filters={quote(f)}")
+    elif status == "closed":
+        f = json.dumps([{"status_id": {"operator": "c", "values": None}}])
+        params.append(f"filters={quote(f)}")
+    if offset is not None:
+        params.append(f"offset={offset}")
+    if page_size is not None:
+        params.append(f"pageSize={page_size}")
+
+    # A5: Baseline comparison timestamps
+    if "timestamps" in args:
+        params.append(f"timestamps={quote(args['timestamps'])}")
+
+    endpoint = base + ("?" + "&".join(params) if params else "")
+    result = await client.get(endpoint)
+    wps = client._ensure_collection(result)
+    total = result.get("total", len(wps))
+    count = result.get("count", len(wps))
+
+    if not wps:
+        return "No work packages found."
+    text = f"Found {total} work package(s) (showing {count}):\n\n"
+    for wp in wps:
+        text += f"- **{wp.get('subject', 'No title')}** (#{wp.get('id')})\n"
+        emb = wp.get("_embedded", {})
+        parts = []
+        if "type" in emb:
+            parts.append(f"Type: {emb['type'].get('name')}")
+        if "status" in emb:
+            parts.append(f"Status: {emb['status'].get('name')}")
+        if "project" in emb:
+            parts.append(f"Project: {emb['project'].get('name')}")
+        if emb.get("assignee"):
+            parts.append(f"Assignee: {emb['assignee'].get('name')}")
+        if parts:
+            text += f"  {' | '.join(parts)}\n"
+        if wp.get("percentageDone"):
+            text += f"  Progress: {wp['percentageDone']}%\n"
+        text += "\n"
+    return text
+
+
+async def h_wp_get(client, args):
+    endpoint = f"/work_packages/{args['work_package_id']}"
+    # A5: Baseline comparison timestamps
+    if "timestamps" in args:
+        endpoint += f"?timestamps={quote(args['timestamps'])}"
+    r = await client.get(endpoint)
+    emb = r.get("_embedded", {})
+    text = f"**Work Package Details:**\n\n"
+    text += f"- **ID**: #{r.get('id')}\n- **Subject**: {r.get('subject')}\n"
+    for key, label in [
+        ("type", "Type"),
+        ("status", "Status"),
+        ("priority", "Priority"),
+        ("project", "Project"),
+    ]:
+        if key in emb:
+            text += f"- **{label}**: {emb[key].get('name')}\n"
+    if emb.get("assignee"):
+        text += f"- **Assignee**: {emb['assignee'].get('name')}\n"
+    else:
+        text += f"- **Assignee**: Unassigned\n"
+    text += f"- **Progress**: {r.get('percentageDone', 0)}%\n"
+    text += (
+        f"- **Created**: {r.get('createdAt', 'N/A')}\n"
+        f"- **Updated**: {r.get('updatedAt', 'N/A')}\n"
+    )
+    if r.get("startDate"):
+        text += f"- **Start Date**: {r['startDate']}\n"
+    if r.get("dueDate"):
+        text += f"- **Due Date**: {r['dueDate']}\n"
+    desc = (r.get("description") or {}).get("raw")
+    if desc:
+        text += f"\n**Description:**\n{desc}\n"
+    return text
+
+
+async def h_wp_create(client, args):
+    data = {
+        "project": args["project_id"],
+        "subject": args["subject"],
+        "type": args["type_id"],
+    }
+    for f in ("description", "priority_id", "assignee_id"):
+        if f in args:
+            data[f] = args[f]
+    if "start_date" in args:
+        data["startDate"] = args["start_date"]
+    if "due_date" in args:
+        data["dueDate"] = args["due_date"]
+    if "date" in args:
+        data["date"] = args["date"]
+
+    r = await client.create_work_package(data)
+    emb = r.get("_embedded", {})
+    text = f"✅ Work package created:\n\n- **ID**: #{r.get('id')}\n- **Subject**: {r.get('subject')}\n"
+    if "type" in emb:
+        text += f"- **Type**: {emb['type'].get('name')}\n"
+    if "status" in emb:
+        text += f"- **Status**: {emb['status'].get('name')}\n"
+    if "project" in emb:
+        text += f"- **Project**: {emb['project'].get('name')}\n"
+    return text
+
+
+async def h_wp_update(client, args):
+    wp_id = args["work_package_id"]
+    data = {}
+    for f in (
+        "subject",
+        "description",
+        "type_id",
+        "status_id",
+        "priority_id",
+        "assignee_id",
+        "percentage_done",
+    ):
+        if f in args:
+            data[f] = args[f]
+    if "start_date" in args:
+        data["startDate"] = args["start_date"]
+    if "due_date" in args:
+        data["dueDate"] = args["due_date"]
+    if "date" in args:
+        data["date"] = args["date"]
+    if not data:
+        return "❌ No fields provided to update."
+
+    r = await client.update_work_package(wp_id, data)
+    emb = r.get("_embedded", {})
+    text = f"✅ Work package #{wp_id} updated:\n- **Subject**: {r.get('subject')}\n"
+    if "status" in emb:
+        text += f"- **Status**: {emb['status'].get('name')}\n"
+    if "priority" in emb:
+        text += f"- **Priority**: {emb['priority'].get('name')}\n"
+    if emb.get("assignee"):
+        text += f"- **Assignee**: {emb['assignee'].get('name')}\n"
+    text += f"- **Progress**: {r.get('percentageDone', 0)}%\n"
+    return text
+
+
+async def h_wp_delete(client, args):
+    await client.delete_resource(f"/work_packages/{args['work_package_id']}")
+    return f"✅ Work package #{args['work_package_id']} deleted."
+
+
+async def h_wp_set_parent(client, args):
+    r = await client.set_work_package_parent(
+        args["work_package_id"], args["parent_id"]
+    )
+    return (
+        f"✅ WP #{args['work_package_id']} is now a child of #{args['parent_id']}. "
+        f"Subject: {r.get('subject')}"
+    )
+
+
+async def h_wp_remove_parent(client, args):
+    r = await client.remove_work_package_parent(args["work_package_id"])
+    return (
+        f"✅ WP #{args['work_package_id']} is now top-level. "
+        f"Subject: {r.get('subject')}"
+    )
+
+
+async def h_wp_list_children(client, args):
+    pid = args["parent_id"]
+    desc = args.get("include_descendants", False)
+    filter_key = "ancestor" if desc else "parent"
+    filters = json.dumps([{filter_key: {"operator": "=", "values": [str(pid)]}}])
+    result = await client.get(f"/work_packages?filters={quote(filters)}")
+    children = client._ensure_collection(result)
+    label = "Descendants" if desc else "Children"
+    if not children:
+        return f"No {label.lower()} found for WP #{pid}."
+    text = f"**{label} of WP #{pid} ({len(children)}):**\n\n"
+    for c in children:
+        emb = c.get("_embedded", {})
+        status = emb.get("status", {}).get("name", "")
+        text += f"- **#{c.get('id')}**: {c.get('subject')} [{status}]\n"
+    return text
+
+
+async def h_wp_list_activities(client, args):
+    items = await client.get_collection(
+        f"/work_packages/{args['work_package_id']}/activities"
+    )
+    if not items:
+        return f"No activities for WP #{args['work_package_id']}."
+    text = f"**Activities for WP #{args['work_package_id']} ({len(items)}):**\n\n"
+    for a in items:
+        user = a.get("_links", {}).get("user", {}).get("title", "System")
+        text += f"- **#{a.get('id')}** by {user} at {a.get('createdAt', 'N/A')}\n"
+        comment = (a.get("comment") or {}).get("raw")
+        if comment:
+            text += f"  Comment: {comment}\n"
+    return text
+
+
+async def h_wp_add_comment(client, args):
+    payload = {"comment": {"raw": args["comment"]}}
+    r = await client.post(
+        f"/work_packages/{args['work_package_id']}/activities", payload
+    )
+    return (
+        f"✅ Comment added to WP #{args['work_package_id']} "
+        f"(activity #{r.get('id')})"
+    )
+
+
+async def h_wp_list_attachments(client, args):
+    items = await client.get_collection(
+        f"/work_packages/{args['work_package_id']}/attachments"
+    )
+    if not items:
+        return f"No attachments for WP #{args['work_package_id']}."
+    text = f"**Attachments for WP #{args['work_package_id']} ({len(items)}):**\n\n"
+    for a in items:
+        text += (
+            f"- **{a.get('fileName')}** (ID: {a.get('id')}, "
+            f"{a.get('fileSize', 0)} bytes)\n"
+        )
+    return text
+
+
+async def h_wp_list_watchers(client, args):
+    items = await client.get_collection(
+        f"/work_packages/{args['work_package_id']}/watchers"
+    )
+    if not items:
+        return f"No watchers for WP #{args['work_package_id']}."
+    text = f"**Watchers for WP #{args['work_package_id']} ({len(items)}):**\n\n"
+    for w in items:
+        text += f"- **{w.get('name')}** (ID: {w.get('id')})\n"
+    return text
+
+
+async def h_wp_add_watcher(client, args):
+    payload = {"user": {"href": f"/api/v3/users/{args['user_id']}"}}
+    await client.post(
+        f"/work_packages/{args['work_package_id']}/watchers", payload
+    )
+    return (
+        f"✅ User #{args['user_id']} added as watcher to "
+        f"WP #{args['work_package_id']}"
+    )
+
+
+async def h_wp_remove_watcher(client, args):
+    await client.delete_resource(
+        f"/work_packages/{args['work_package_id']}/watchers/{args['user_id']}"
+    )
+    return (
+        f"✅ User #{args['user_id']} removed from watchers of "
+        f"WP #{args['work_package_id']}"
+    )
+
+
+async def h_wp_list_relations(client, args):
+    conditions = []
+    if "work_package_id" in args:
+        conditions.append(
+            {
+                "involved": {
+                    "operator": "=",
+                    "values": [str(args["work_package_id"])],
+                }
+            }
+        )
+    if "relation_type" in args:
+        conditions.append(
+            {"type": {"operator": "=", "values": [args["relation_type"]]}}
+        )
+    endpoint = "/relations?pageSize=100"
+    if conditions:
+        endpoint += f"&filters={quote(json.dumps(conditions))}"
+    result = await client.get(endpoint)
+    rels = client._ensure_collection(result)
+    if not rels:
+        return "No relations found."
+    text = f"**Work Package Relations ({len(rels)}):**\n\n"
+    for rel in rels:
+        # Try _embedded first (present on single-resource), fall back to _links (collection)
+        emb = rel.get("_embedded", {})
+        links = rel.get("_links", {})
+        from_wp = emb.get("from") or {}
+        to_wp = emb.get("to") or {}
+        if from_wp.get("id"):
+            from_id = from_wp["id"]
+            from_subj = from_wp.get("subject", "?")
+        else:
+            from_link = links.get("from", {})
+            from_href = from_link.get("href", "")
+            from_id = from_href.rsplit("/", 1)[-1] if from_href else "?"
+            from_subj = from_link.get("title", "?")
+        if to_wp.get("id"):
+            to_id = to_wp["id"]
+            to_subj = to_wp.get("subject", "?")
+        else:
+            to_link = links.get("to", {})
+            to_href = to_link.get("href", "")
+            to_id = to_href.rsplit("/", 1)[-1] if to_href else "?"
+            to_subj = to_link.get("title", "?")
+        text += (
+            f"- **#{rel.get('id')}**: {rel.get('type')} — "
+            f"#{from_id} ({from_subj}) → "
+            f"#{to_id} ({to_subj})\n"
+        )
+        if rel.get("lag"):
+            text += f"  Lag: {rel['lag']} days\n"
+    return text
+
+
+async def h_wp_create_relation(client, args):
+    data = {
+        "from_id": args["from_id"],
+        "to_id": args["to_id"],
+        "relation_type": args["relation_type"],
+    }
+    for f in ("lag", "description"):
+        if f in args:
+            data[f] = args[f]
+    r = await client.create_relation(data)
+    text = (
+        f"✅ Relation created: #{r.get('id')} ({r.get('type')}) "
+        f"WP#{args['from_id']} → WP#{args['to_id']}"
+    )
+    if r.get("lag"):
+        text += f" (lag: {r['lag']} days)"
+    return text
+
+
+async def h_wp_get_relation(client, args):
+    r = await client.get(f"/relations/{args['relation_id']}")
+    emb = r.get("_embedded", {})
+    from_wp = emb.get("from", {})
+    to_wp = emb.get("to", {})
+    return (
+        f"**Relation #{r.get('id')}:**\n"
+        f"- Type: {r.get('type')} (reverse: {r.get('reverseType')})\n"
+        f"- From: #{from_wp.get('id')} — {from_wp.get('subject')}\n"
+        f"- To: #{to_wp.get('id')} — {to_wp.get('subject')}\n"
+        f"- Lag: {r.get('lag', 0)} days\n"
+    )
+
+
+async def h_wp_update_relation(client, args):
+    rid = args["relation_id"]
+    data = {
+        k: args[k] for k in ("relation_type", "lag", "description") if k in args
+    }
+    if not data:
+        return "❌ No fields provided to update."
+    r = await client.update_relation(rid, data)
+    return f"✅ Relation #{rid} updated. Type: {r.get('type')}, Lag: {r.get('lag', 0)}"
+
+
+async def h_wp_delete_relation(client, args):
+    await client.delete_resource(f"/relations/{args['relation_id']}")
+    return f"✅ Relation #{args['relation_id']} deleted."
+
+
+async def h_wp_list_available_watchers(client, args):
+    items = await client.get_collection(
+        f"/work_packages/{args['work_package_id']}/available_watchers"
+    )
+    if not items:
+        return "No available watchers."
+    text = "Available watchers:\n\n"
+    for u in items:
+        text += f"- **{u.get('name')}** (ID: {u.get('id')})\n"
+    return text
+
+
+async def h_wp_list_available_relation_candidates(client, args):
+    endpoint = (
+        f"/work_packages/{args['work_package_id']}/available_relation_candidates"
+    )
+    if args.get("query"):
+        endpoint += f"?query={quote(args['query'])}"
+    items = await client.get_collection(endpoint)
+    if not items:
+        return "No relation candidates found."
+    text = f"Available relation candidates ({len(items)}):\n\n"
+    for wp in items:
+        text += f"- **#{wp.get('id')}**: {wp.get('subject')}\n"
+    return text
+
+
+# ── time_entry handlers ──────────────────────────────────────────────
+
+
+async def h_te_list(client, args):
+    filters = []
+    if "work_package_id" in args:
+        filters.append(
+            {
+                "workPackage": {
+                    "operator": "=",
+                    "values": [str(args["work_package_id"])],
+                }
+            }
+        )
+    if "user_id" in args:
+        filters.append(
+            {"user": {"operator": "=", "values": [str(args["user_id"])]}}
+        )
+    endpoint = "/time_entries"
+    if filters:
+        endpoint += f"?filters={quote(json.dumps(filters))}"
+    result = await client.get(endpoint)
+    entries = client._ensure_collection(result)
+    if not entries:
+        return "No time entries found."
+    text = f"Found {len(entries)} time entry(ies):\n\n"
+    for e in entries:
+        hours = _parse_iso_duration_hours(e.get("hours", "PT0H"))
+        emb = e.get("_embedded", {})
+        wp_name = emb.get("workPackage", {}).get("subject", "?")
+        user_name = emb.get("user", {}).get("name", "?")
+        text += (
+            f"- **#{e.get('id')}**: {hours}h on {e.get('spentOn', '?')} "
+            f"by {user_name} — {wp_name}\n"
+        )
+        comment = (e.get("comment") or {}).get("raw")
+        if comment:
+            text += f"  Comment: {comment}\n"
+    return text
+
+
+async def h_te_get(client, args):
+    r = await client.get(f"/time_entries/{args['time_entry_id']}")
+    hours = _parse_iso_duration_hours(r.get("hours", "PT0H"))
+    emb = r.get("_embedded", {})
+    text = f"**Time Entry #{r.get('id')}:**\n"
+    text += f"- Hours: {hours}\n- Date: {r.get('spentOn')}\n"
+    if "workPackage" in emb:
+        text += f"- Work Package: {emb['workPackage'].get('subject')}\n"
+    if "user" in emb:
+        text += f"- User: {emb['user'].get('name')}\n"
+    if "activity" in emb:
+        text += f"- Activity: {emb['activity'].get('name')}\n"
+    return text
+
+
+async def h_te_create(client, args):
+    data = {
+        "work_package_id": args["work_package_id"],
+        "hours": args["hours"],
+        "spent_on": args["spent_on"],
+    }
+    for f in ("comment", "activity_id"):
+        if f in args:
+            data[f] = args[f]
+    r = await client.create_time_entry(data)
+    hours = _parse_iso_duration_hours(r.get("hours", "PT0H"))
+    return f"✅ Time entry created: #{r.get('id')} — {hours}h on {r.get('spentOn')}"
+
+
+async def h_te_update(client, args):
+    te_id = args["time_entry_id"]
+    data = {
+        k: args[k]
+        for k in ("hours", "spent_on", "comment", "activity_id")
+        if k in args
+    }
+    if not data:
+        return "❌ No fields provided to update."
+    r = await client.update_time_entry(te_id, data)
+    hours = _parse_iso_duration_hours(r.get("hours", "PT0H"))
+    return f"✅ Time entry #{te_id} updated: {hours}h on {r.get('spentOn')}"
+
+
+async def h_te_delete(client, args):
+    await client.delete_resource(f"/time_entries/{args['time_entry_id']}")
+    return f"✅ Time entry #{args['time_entry_id']} deleted."
+
+
+async def h_te_list_activities(client, args):
+    try:
+        items = await client.get_collection("/time_entries/activities")
+        if not items:
+            raise Exception("empty")
+    except Exception:
+        return (
+            "Available time entry activities (defaults):\n\n"
+            "- **Management** (ID: 1)\n"
+            "- **Specification** (ID: 2)\n"
+            "- **Development** (ID: 3)\n"
+            "- **Testing** (ID: 4)\n"
+        )
+    text = "Available time entry activities:\n\n"
+    for a in items:
+        text += f"- **{a.get('name')}** (ID: {a.get('id')})"
+        if a.get("isDefault"):
+            text += " ✓Default"
+        text += "\n"
+    return text
+
+
+# ── membership handlers ──────────────────────────────────────────────
+
+
+async def h_mem_list(client, args):
+    endpoint = "/memberships?pageSize=100"
+    filters = []
+    if "project_id" in args:
+        filters.append(
+            {"project": {"operator": "=", "values": [str(args["project_id"])]}}
+        )
+    if "user_id" in args:
+        filters.append(
+            {"principal": {"operator": "=", "values": [str(args["user_id"])]}}
+        )
+    if filters:
+        endpoint += f"&filters={quote(json.dumps(filters))}"
+    result = await client.get(endpoint)
+    mems = client._ensure_collection(result)
+    if not mems:
+        return "No memberships found."
+    text = f"Found {len(mems)} membership(s):\n\n"
+    for m in mems:
+        links = m.get("_links", {})
+        principal = links.get("principal", {}).get("title", "?")
+        project = links.get("project", {}).get("title", "?")
+        roles = ", ".join(r.get("title", "?") for r in links.get("roles", []))
+        text += f"- **#{m.get('id')}**: {principal} in {project} — {roles}\n"
+    return text
+
+
+async def h_mem_get(client, args):
+    r = await client.get(f"/memberships/{args['membership_id']}")
+    links = r.get("_links", {})
+    principal = links.get("principal", {}).get("title", "?")
+    project = links.get("project", {}).get("title", "?")
+    roles = ", ".join(ro.get("title", "?") for ro in links.get("roles", []))
+    return (
+        f"**Membership #{r.get('id')}:**\n"
+        f"- Principal: {principal}\n"
+        f"- Project: {project}\n"
+        f"- Roles: {roles}\n"
+    )
+
+
+async def h_mem_create(client, args):
+    data = {"project_id": args["project_id"]}
+    if "user_id" in args:
+        data["user_id"] = args["user_id"]
+    elif "group_id" in args:
+        data["group_id"] = args["group_id"]
+    else:
+        return "❌ Either user_id or group_id is required."
+    if "role_ids" in args:
+        data["role_ids"] = args["role_ids"]
+    elif "role_id" in args:
+        data["role_id"] = args["role_id"]
+    else:
+        return "❌ Either role_ids or role_id is required."
+    if "notification_message" in args:
+        data["notification_message"] = args["notification_message"]
+    r = await client.create_membership(data)
+    emb = r.get("_embedded", {})
+    principal = emb.get("principal", {}).get("name", "?")
+    project = emb.get("project", {}).get("name", "?")
+    return f"✅ Membership #{r.get('id')} created: {principal} in {project}"
+
+
+async def h_mem_update(client, args):
+    mid = args["membership_id"]
+    data = {}
+    for f in ("role_ids", "role_id", "notification_message"):
+        if f in args:
+            data[f] = args[f]
+    if not data:
+        return "❌ No fields provided to update."
+    await client.update_membership(mid, data)
+    return f"✅ Membership #{mid} updated."
+
+
+async def h_mem_delete(client, args):
+    await client.delete_resource(f"/memberships/{args['membership_id']}")
+    return f"✅ Membership #{args['membership_id']} deleted."
+
+
+async def h_mem_list_project_members(client, args):
+    pid = args["project_id"]
+    f = json.dumps([{"project": {"operator": "=", "values": [str(pid)]}}])
+    endpoint = f"/memberships?pageSize=100&filters={quote(f)}"
+    result = await client.get(endpoint)
+    mems = client._ensure_collection(result)
+    if not mems:
+        return f"No members found for project #{pid}."
+    text = f"**Project #{pid} Members ({len(mems)}):**\n\n"
+    for m in mems:
+        links = m.get("_links", {})
+        name = links.get("principal", {}).get("title", "?")
+        roles = ", ".join(r.get("title", "?") for r in links.get("roles", []))
+        text += f"- **{name}**: {roles}\n"
+    return text
+
+
+async def h_mem_list_user_projects(client, args):
+    uid = args["user_id"]
+    f = json.dumps([{"principal": {"operator": "=", "values": [str(uid)]}}])
+    endpoint = f"/memberships?pageSize=100&filters={quote(f)}"
+    result = await client.get(endpoint)
+    mems = client._ensure_collection(result)
+    if not mems:
+        return f"No projects found for user #{uid}."
+    text = f"**User #{uid} Projects ({len(mems)}):**\n\n"
+    for m in mems:
+        links = m.get("_links", {})
+        proj = links.get("project", {}).get("title", "?")
+        roles = ", ".join(r.get("title", "?") for r in links.get("roles", []))
+        text += f"- **{proj}**: {roles}\n"
+    return text
+
+
+# ── principal handlers ───────────────────────────────────────────────
+
+
+async def h_principal_list_users(client, args):
+    endpoint = "/users?pageSize=100"
+    if args.get("active_only", True):
+        f = json.dumps([{"status": {"operator": "=", "values": ["active"]}}])
+        endpoint += f"&filters={quote(f)}"
+    result = await client.get(endpoint)
+    users = client._ensure_collection(result)
+    if not users:
+        return "No users found."
+    text = f"Found {len(users)} user(s):\n\n"
+    for u in users:
+        text += (
+            f"- **{u.get('name')}** (ID: {u.get('id')}) — "
+            f"{u.get('email', 'N/A')} [{u.get('status')}]"
+        )
+        if u.get("admin"):
+            text += " ✓Admin"
+        text += "\n"
+    return text
+
+
+async def h_principal_get_user(client, args):
+    r = await client.get(f"/users/{args['user_id']}")
+    return (
+        f"**User #{r.get('id')}:**\n"
+        f"- Name: {r.get('name')}\n"
+        f"- Email: {r.get('email', 'N/A')}\n"
+        f"- Status: {r.get('status')}\n"
+        f"- Admin: {'Yes' if r.get('admin') else 'No'}\n"
+        f"- Language: {r.get('language', 'N/A')}\n"
+        f"- Created: {r.get('createdAt')}\n"
+        f"- Updated: {r.get('updatedAt')}\n"
+    )
+
+
+async def h_principal_create_user(client, args):
+    r = await client.post("/users", args.get("payload", {}))
+    return f"✅ User created: #{r.get('id')} — {r.get('name')} ({r.get('email')})"
+
+
+async def h_principal_update_user(client, args):
+    r = await client.patch(f"/users/{args['user_id']}", args.get("payload", {}))
+    return f"✅ User #{args['user_id']} updated: {r.get('name')}"
+
+
+async def h_principal_delete_user(client, args):
+    await client.delete_resource(f"/users/{args['user_id']}")
+    return f"✅ User #{args['user_id']} deleted."
+
+
+async def h_principal_lock_user(client, args):
+    await client.post(f"/users/{args['user_id']}/lock")
+    return f"✅ User #{args['user_id']} locked."
+
+
+async def h_principal_unlock_user(client, args):
+    await client.delete_resource(f"/users/{args['user_id']}/lock")
+    return f"✅ User #{args['user_id']} unlocked."
+
+
+async def h_principal_list_groups(client, args):
+    items = await client.get_collection("/groups")
+    if not items:
+        return "No groups found."
+    text = f"Found {len(items)} group(s):\n\n"
+    for g in items:
+        text += f"- **{g.get('name')}** (ID: {g.get('id')})\n"
+    return text
+
+
+async def h_principal_get_group(client, args):
+    r = await client.get(f"/groups/{args['group_id']}")
+    return f"**Group #{r.get('id')}:** {r.get('name')}\n"
+
+
+async def h_principal_create_group(client, args):
+    r = await client.post("/groups", args.get("payload", {}))
+    return f"✅ Group created: #{r.get('id')} — {r.get('name')}"
+
+
+async def h_principal_update_group(client, args):
+    await client.patch(f"/groups/{args['group_id']}", args.get("payload", {}))
+    return f"✅ Group #{args['group_id']} updated."
+
+
+async def h_principal_delete_group(client, args):
+    await client.delete_resource(f"/groups/{args['group_id']}")
+    return f"✅ Group #{args['group_id']} deleted."
+
+
+async def h_principal_list_roles(client, args):
+    result = await client.get("/roles?pageSize=100")
+    roles = client._ensure_collection(result)
+    if not roles:
+        return "No roles found."
+    text = f"Available roles ({len(roles)}):\n\n"
+    for r in roles:
+        text += f"- **{r.get('name')}** (ID: {r.get('id')})\n"
+    return text
+
+
+async def h_principal_get_role(client, args):
+    r = await client.get(f"/roles/{args['role_id']}")
+    text = f"**Role #{r.get('id')}:** {r.get('name')}\n"
+    if r.get("permissions"):
+        text += f"  {len(r['permissions'])} permissions\n"
+    return text
+
+
+async def h_principal_list_principals(client, args):
+    items = await client.get_collection("/principals?pageSize=100")
+    if not items:
+        return "No principals found."
+    text = f"Found {len(items)} principal(s):\n\n"
+    for p in items:
+        text += (
+            f"- **{p.get('name')}** (ID: {p.get('id')}, "
+            f"type: {p.get('_type', '?')})\n"
+        )
+    return text
+
+
+# ── version handlers ─────────────────────────────────────────────────
+
+
+async def h_version_list(client, args):
+    return await h_project_list_versions(client, args)
+
+
+async def h_version_get(client, args):
+    r = await client.get(f"/versions/{args['version_id']}")
+    text = f"**Version #{r.get('id')}:** {r.get('name')}\n"
+    text += f"- Status: {r.get('status')}\n"
+    if r.get("startDate"):
+        text += f"- Start: {r['startDate']}\n"
+    if r.get("endDate"):
+        text += f"- End: {r['endDate']}\n"
+    desc = (r.get("description") or {}).get("raw")
+    if desc:
+        text += f"- Description: {desc}\n"
+    return text
+
+
+async def h_version_create(client, args):
+    data = {"name": args["name"]}
+    for f in ("description", "start_date", "end_date", "status"):
+        if f in args:
+            data[f] = args[f]
+    r = await client.create_version(args["project_id"], data)
+    return (
+        f"✅ Version created: #{r.get('id')} — "
+        f"{r.get('name')} [{r.get('status')}]"
+    )
+
+
+async def h_version_update(client, args):
+    vid = args["version_id"]
+    data = {
+        k: args[k]
+        for k in ("name", "description", "start_date", "end_date", "status")
+        if k in args
+    }
+    if not data:
+        return "❌ No fields provided to update."
+    r = await client.update_version(vid, data)
+    return f"✅ Version #{vid} updated: {r.get('name')} [{r.get('status')}]"
+
+
+async def h_version_delete(client, args):
+    await client.delete_resource(f"/versions/{args['version_id']}")
+    return f"✅ Version #{args['version_id']} deleted."
+
+
+async def h_version_list_projects(client, args):
+    items = await client.get_collection(
+        f"/versions/{args['version_id']}/projects"
+    )
+    if not items:
+        return "No projects share this version."
+    text = f"Projects sharing version #{args['version_id']}:\n\n"
+    for p in items:
+        text += f"- **{p.get('name')}** (ID: {p.get('id')})\n"
+    return text
+
+
+# ── query_view handlers ──────────────────────────────────────────────
+
+
+async def h_qv_list_queries(client, args):
+    items = await client.get_collection("/queries?pageSize=100")
+    if not items:
+        return "No queries found."
+    text = f"Found {len(items)} query(ies):\n\n"
+    for q in items:
+        text += f"- **{q.get('name')}** (ID: {q.get('id')})"
+        if q.get("starred"):
+            text += " ★"
+        if q.get("public"):
+            text += " [public]"
+        text += "\n"
+    return text
+
+
+async def h_qv_get_query(client, args):
+    r = await client.get(f"/queries/{args['query_id']}")
+    return (
+        f"**Query #{r.get('id')}:** {r.get('name')}\n"
+        f"- Public: {r.get('public')}\n"
+        f"- Starred: {r.get('starred')}\n"
+    )
+
+
+async def h_qv_create_query(client, args):
+    r = await client.post("/queries", args.get("payload", {}))
+    return f"✅ Query created: #{r.get('id')} — {r.get('name')}"
+
+
+async def h_qv_update_query(client, args):
+    await client.patch(
+        f"/queries/{args['query_id']}", args.get("payload", {})
+    )
+    return f"✅ Query #{args['query_id']} updated."
+
+
+async def h_qv_delete_query(client, args):
+    await client.delete_resource(f"/queries/{args['query_id']}")
+    return f"✅ Query #{args['query_id']} deleted."
+
+
+async def h_qv_star(client, args):
+    await client.patch(f"/queries/{args['query_id']}/star")
+    return f"✅ Query #{args['query_id']} starred."
+
+
+async def h_qv_unstar(client, args):
+    await client.patch(f"/queries/{args['query_id']}/unstar")
+    return f"✅ Query #{args['query_id']} unstarred."
+
+
+async def h_qv_get_default(client, args):
+    pid = args.get("project_id")
+    endpoint = (
+        f"/projects/{pid}/queries/default" if pid else "/queries/default"
+    )
+    r = await client.get(endpoint)
+    return f"**Default Query:** {r.get('name')} (ID: {r.get('id')})\n"
+
+
+# ── notification handlers ───────────────────────────────────────────
+
+
+async def h_notif_list(client, args):
+    items = await client.get_collection("/notifications?pageSize=100")
+    if not items:
+        return "No notifications."
+    text = f"Found {len(items)} notification(s):\n\n"
+    for n in items:
+        reason = n.get("reason", "?")
+        read = "read" if n.get("readIAN") else "unread"
+        text += f"- **#{n.get('id')}**: {reason} [{read}]\n"
+    return text
+
+
+async def h_notif_get(client, args):
+    r = await client.get(f"/notifications/{args['notification_id']}")
+    return (
+        f"**Notification #{r.get('id')}:**\n"
+        f"- Reason: {r.get('reason')}\n"
+        f"- Read: {r.get('readIAN')}\n"
+        f"- Created: {r.get('createdAt')}\n"
+    )
+
+
+async def h_notif_get_detail(client, args):
+    r = await client.get(
+        f"/notifications/{args['notification_id']}/details/{args['detail_id']}"
+    )
+    return f"**Notification Detail:**\n{json.dumps(r, indent=2)[:2000]}"
+
+
+async def h_notif_mark_read(client, args):
+    await client.post(f"/notifications/{args['notification_id']}/read_ian")
+    return f"✅ Notification #{args['notification_id']} marked as read."
+
+
+async def h_notif_mark_unread(client, args):
+    await client.post(f"/notifications/{args['notification_id']}/unread_ian")
+    return f"✅ Notification #{args['notification_id']} marked as unread."
+
+
+async def h_notif_mark_all_read(client, args):
+    await client.post("/notifications/read_ian")
+    return "✅ All notifications marked as read."
+
+
+async def h_notif_mark_all_unread(client, args):
+    await client.post("/notifications/unread_ian")
+    return "✅ All notifications marked as unread."
+
+
+# ── artifact handlers ────────────────────────────────────────────────
+
+
+async def h_art_list_news(client, args):
+    items = await client.get_collection("/news?pageSize=100")
+    if not items:
+        return "No news found."
+    text = f"Found {len(items)} news item(s):\n\n"
+    for n in items:
+        text += (
+            f"- **{n.get('title')}** (ID: {n.get('id')}) — "
+            f"{n.get('createdAt', '?')}\n"
+        )
+    return text
+
+
+async def h_art_get_news(client, args):
+    r = await client.get(f"/news/{args['news_id']}")
+    desc = (r.get("description") or {}).get("raw", "")
+    return f"**News #{r.get('id')}:** {r.get('title')}\n{desc}\n"
+
+
+async def h_art_create_news(client, args):
+    r = await client.post("/news", args.get("payload", {}))
+    return f"✅ News created: #{r.get('id')} — {r.get('title')}"
+
+
+async def h_art_update_news(client, args):
+    await client.patch(f"/news/{args['news_id']}", args.get("payload", {}))
+    return f"✅ News #{args['news_id']} updated."
+
+
+async def h_art_delete_news(client, args):
+    await client.delete_resource(f"/news/{args['news_id']}")
+    return f"✅ News #{args['news_id']} deleted."
+
+
+async def h_art_get_wiki_page(client, args):
+    r = await client.get(f"/wiki_pages/{args['wiki_page_id']}")
+    return f"**Wiki Page #{r.get('id')}:** {r.get('title', '?')}\n"
+
+
+async def h_art_get_document(client, args):
+    r = await client.get(f"/documents/{args['document_id']}")
+    return f"**Document #{r.get('id')}:** {r.get('title', '?')}\n"
+
+
+async def h_art_list_documents(client, args):
+    items = await client.get_collection("/documents?pageSize=100")
+    if not items:
+        return "No documents found."
+    text = f"Found {len(items)} document(s):\n\n"
+    for d in items:
+        text += f"- **{d.get('title', '?')}** (ID: {d.get('id')})\n"
+    return text
+
+
+async def h_art_get_meeting(client, args):
+    r = await client.get(f"/meetings/{args['meeting_id']}")
+    return f"**Meeting #{r.get('id')}:** {r.get('title', '?')}\n"
+
+
+async def h_art_get_attachment(client, args):
+    r = await client.get(f"/attachments/{args['attachment_id']}")
+    return (
+        f"**Attachment #{r.get('id')}:** {r.get('fileName')} "
+        f"({r.get('fileSize', 0)} bytes)\n"
+    )
+
+
+async def h_art_delete_attachment(client, args):
+    await client.delete_resource(f"/attachments/{args['attachment_id']}")
+    return f"✅ Attachment #{args['attachment_id']} deleted."
+
+
+# ── integration handlers ────────────────────────────────────────────
+
+
+async def h_int_test_connection(client, args):
+    r = await client.get("")
+    text = "✅ API connection successful!\n"
+    if client.proxy:
+        text += f"Connected via proxy: {client.proxy}\n"
+    text += (
+        f"Instance: {r.get('instanceName', '?')}\n"
+        f"Version: {r.get('coreVersion', '?')}\n"
+    )
+    return text
+
+
+async def h_int_check_permissions(client, args):
+    r = await client.get("/users/me")
+    if not r:
+        return "❌ Unable to retrieve user permissions."
+    text = (
+        f"**Current User:**\n"
+        f"- Name: {r.get('name')}\n"
+        f"- ID: {r.get('id')}\n"
+        f"- Email: {r.get('email', 'N/A')}\n"
+        f"- Admin: {'Yes' if r.get('admin') else 'No'}\n"
+        f"- Status: {r.get('status')}\n"
+        f"- Language: {r.get('language', 'N/A')}\n"
+    )
+    if "_links" in r:
+        actions = [
+            k for k in r["_links"] if k not in ("self", "showUser")
+        ]
+        if actions:
+            text += f"\nAvailable actions: {', '.join(actions)}\n"
+    return text
+
+
+async def h_int_list_statuses(client, args):
+    result = await client.get("/statuses?pageSize=100")
+    items = client._ensure_collection(result)
+    if not items:
+        return "No statuses found."
+    text = "Available statuses:\n\n"
+    for s in items:
+        text += f"- **{s.get('name')}** (ID: {s.get('id')})"
+        if s.get("isDefault"):
+            text += " ✓Default"
+        if s.get("isClosed"):
+            text += " ✓Closed"
+        text += f" (position: {s.get('position', 'N/A')})\n"
+    return text
+
+
+async def h_int_get_status(client, args):
+    r = await client.get(f"/statuses/{args['status_id']}")
+    return (
+        f"**Status #{r.get('id')}:** {r.get('name')} "
+        f"(default: {r.get('isDefault')}, closed: {r.get('isClosed')})\n"
+    )
+
+
+async def h_int_list_priorities(client, args):
+    result = await client.get("/priorities?pageSize=100")
+    items = client._ensure_collection(result)
+    if not items:
+        return "No priorities found."
+    text = "Available priorities:\n\n"
+    for p in items:
+        text += f"- **{p.get('name')}** (ID: {p.get('id')})"
+        if p.get("isDefault"):
+            text += " ✓Default"
+        if p.get("isActive"):
+            text += " ✓Active"
+        text += f" (position: {p.get('position', 'N/A')})\n"
+    return text
+
+
+async def h_int_get_priority(client, args):
+    r = await client.get(f"/priorities/{args['priority_id']}")
+    return (
+        f"**Priority #{r.get('id')}:** {r.get('name')} "
+        f"(default: {r.get('isDefault')})\n"
+    )
+
+
+async def h_int_list_types(client, args):
+    return await h_project_list_types(client, args)
+
+
+async def h_int_get_type(client, args):
+    r = await client.get(f"/types/{args['type_id']}")
+    return (
+        f"**Type #{r.get('id')}:** {r.get('name')} "
+        f"(milestone: {r.get('isMilestone')}, default: {r.get('isDefault')})\n"
+    )
+
+
+async def h_int_get_category(client, args):
+    r = await client.get(f"/categories/{args['category_id']}")
+    return f"**Category #{r.get('id')}:** {r.get('name')}\n"
+
+
+async def h_int_list_categories(client, args):
+    items = await client.get_collection(
+        f"/projects/{args['project_id']}/categories"
+    )
+    if not items:
+        return "No categories found."
+    text = f"Categories for project #{args['project_id']}:\n\n"
+    for c in items:
+        text += f"- **{c.get('name')}** (ID: {c.get('id')})\n"
+    return text
+
+
+async def h_int_get_custom_action(client, args):
+    r = await client.get(f"/custom_actions/{args['custom_action_id']}")
+    return (
+        f"**Custom Action #{r.get('id')}:** {r.get('name')}\n"
+        f"- Description: {r.get('description', 'N/A')}\n"
+    )
+
+
+async def h_int_execute_custom_action(client, args):
+    payload = {
+        "lockVersion": args.get("lock_version", 0),
+        "_links": {
+            "workPackage": {
+                "href": f"/api/v3/work_packages/{args['work_package_id']}"
+            }
+        },
+    }
+    await client.post(
+        f"/custom_actions/{args['custom_action_id']}/execute", payload
+    )
+    return (
+        f"✅ Custom action #{args['custom_action_id']} executed on "
+        f"WP #{args['work_package_id']}"
+    )
+
+
+async def h_int_get_configuration(client, args):
+    r = await client.get("/configuration")
+    return f"**Configuration:**\n{json.dumps(r, indent=2)[:3000]}"
+
+
+async def h_int_render_markdown(client, args):
+    r = await client.post_text("/render/markdown", args["text"])
+    return f"**Rendered HTML:**\n{r.get('html', str(r))}"
+
+
+# ── A1: Day/Schedule handlers (integration tool) ─────────────────────
+
+
+async def h_int_list_days(client, args):
+    """List days with optional filters for date range and working status."""
+    filters = []
+    from_date = args.get("from_date")
+    to_date = args.get("to_date")
+    if from_date and to_date:
+        filters.append({"date": {"operator": "<>d", "values": [from_date, to_date]}})
+    elif from_date:
+        filters.append({"date": {"operator": "<>d", "values": [from_date, "2099-12-31"]}})
+    elif to_date:
+        filters.append({"date": {"operator": "<>d", "values": ["2000-01-01", to_date]}})
+    if "working" in args:
+        val = "t" if args["working"] else "f"
+        filters.append({"working": {"operator": "=", "values": [val]}})
+    endpoint = "/days?pageSize=100"
+    if filters:
+        endpoint += f"&filters={quote(json.dumps(filters))}"
+    result = await client.get(endpoint)
+    days = client._ensure_collection(result)
+    if not days:
+        return "No days found matching filters."
+    text = f"Found {len(days)} day(s):\n\n"
+    for d in days:
+        working = "Working" if d.get("working") else "Non-working"
+        name = d.get("name", "")
+        text += f"- **{d.get('date')}** ({name}) — {working}\n"
+    return text
+
+
+async def h_int_get_day(client, args):
+    """Get info for a single day."""
+    date_val = args["date"]
+    filters = [{"date": {"operator": "<>d", "values": [date_val, date_val]}}]
+    endpoint = f"/days?filters={quote(json.dumps(filters))}&pageSize=1"
+    result = await client.get(endpoint)
+    days = client._ensure_collection(result)
+    if not days:
+        return f"No data found for {date_val}."
+    d = days[0]
+    working = "Working" if d.get("working") else "Non-working"
+    return (
+        f"**Day: {d.get('date')}**\n"
+        f"- Name: {d.get('name', 'N/A')}\n"
+        f"- Working: {working}\n"
+    )
+
+
+async def h_int_list_non_working_days(client, args):
+    """List non-working days (holidays, not weekends)."""
+    endpoint = "/days/non_working?pageSize=100"
+    filters = []
+    from_date = args.get("from_date")
+    to_date = args.get("to_date")
+    if from_date and to_date:
+        filters.append({"date": {"operator": "<>d", "values": [from_date, to_date]}})
+    elif from_date:
+        filters.append({"date": {"operator": "<>d", "values": [from_date, "2099-12-31"]}})
+    elif to_date:
+        filters.append({"date": {"operator": "<>d", "values": ["2000-01-01", to_date]}})
+    if filters:
+        endpoint += f"&filters={quote(json.dumps(filters))}"
+    result = await client.get(endpoint)
+    days = client._ensure_collection(result)
+    if not days:
+        return "No non-working days found."
+    text = f"Found {len(days)} non-working day(s):\n\n"
+    for d in days:
+        text += f"- **{d.get('date')}**: {d.get('name', 'N/A')}\n"
+    return text
+
+
+async def h_int_get_week_schedule(client, args):
+    """Get weekly schedule (Mon-Sun working/non-working flags)."""
+    r = await client.get("/days/week")
+    elements = r.get("_embedded", {}).get("elements", [r] if "day" in r else [])
+    if not elements:
+        return f"**Week Schedule:**\n{json.dumps(r, indent=2)[:2000]}"
+    text = "**Week Schedule:**\n\n"
+    for d in elements:
+        working = "Working" if d.get("working") else "Non-working"
+        text += f"- **{d.get('day', d.get('name', '?'))}**: {working}\n"
+    return text
+
+
+# ── A2: Budget handlers (project tool) ───────────────────────────────
+
+
+async def h_project_list_budgets(client, args):
+    """List budgets for a project."""
+    pid = args["project_id"]
+    try:
+        items = await client.get_collection(f"/projects/{pid}/budgets")
+    except Exception as e:
+        if "403" in str(e):
+            return f"Budgets module is not enabled for project #{pid}. Enable it in Project Settings > Modules."
+        raise
+    if not items:
+        return f"No budgets found for project #{pid}."
+    text = f"**Budgets for Project #{pid} ({len(items)}):**\n\n"
+    for b in items:
+        text += f"- **{b.get('subject', 'N/A')}** (ID: {b.get('id')})\n"
+        if b.get("spentUnits") is not None:
+            text += f"  Spent: {b.get('spentUnits')}\n"
+        if b.get("plannedUnits") is not None:
+            text += f"  Planned: {b.get('plannedUnits')}\n"
+    return text
+
+
+async def h_project_get_budget(client, args):
+    """Get a single budget by ID."""
+    r = await client.get(f"/budgets/{args['budget_id']}")
+    text = f"**Budget #{r.get('id')}:** {r.get('subject', 'N/A')}\n"
+    desc = (r.get("description") or {}).get("raw")
+    if desc:
+        text += f"- Description: {desc}\n"
+    text += f"- Created: {r.get('createdAt', 'N/A')}\n"
+    text += f"- Updated: {r.get('updatedAt', 'N/A')}\n"
+    return text
+
+
+# ── A3: Attachment Upload handler (work_package tool) ─────────────────
+
+
+async def h_wp_add_attachment(client, args):
+    """Upload an attachment to a work package via multipart form-data."""
+    wp_id = args["work_package_id"]
+    file_name = args["file_name"]
+    content = args.get("content", "")
+    content_type = args.get("content_type", "application/octet-stream")
+
+    url = f"{client.base_url}/api/v3/work_packages/{wp_id}/attachments"
+    ssl_context = ssl.create_default_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    # Build multipart form
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        content.encode("utf-8") if isinstance(content, str) else content,
+        filename=file_name,
+        content_type=content_type,
+    )
+    if "description" in args:
+        form.add_field(
+            "metadata",
+            json.dumps({"description": {"raw": args["description"]}}),
+            content_type="application/json",
+        )
+
+    headers = {
+        "Authorization": client.headers["Authorization"],
+        "Accept": "application/json",
+    }
+
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout
+    ) as session:
+        request_params = {"url": url, "headers": headers, "data": form}
+        if client.proxy:
+            request_params["proxy"] = client.proxy
+        async with session.post(**request_params) as response:
+            if response.status >= 400:
+                text = await response.text()
+                raise Exception(f"Upload failed ({response.status}): {text[:500]}")
+            r = await response.json()
+            return (
+                f"✅ Attachment uploaded to WP #{wp_id}:\n"
+                f"- File: {r.get('fileName')}\n"
+                f"- ID: {r.get('id')}\n"
+                f"- Size: {r.get('fileSize', 0)} bytes\n"
+            )
+
+
+# ── A4: File Link handlers (work_package + artifact tools) ────────────
+
+
+async def h_wp_list_file_links(client, args):
+    """List file links for a work package."""
+    wp_id = args["work_package_id"]
+    items = await client.get_collection(
+        f"/work_packages/{wp_id}/file_links"
+    )
+    if not items:
+        return f"No file links for WP #{wp_id}."
+    text = f"**File Links for WP #{wp_id} ({len(items)}):**\n\n"
+    for fl in items:
+        origin = fl.get("originData", {})
+        text += (
+            f"- **{origin.get('name', 'N/A')}** (ID: {fl.get('id')})\n"
+            f"  MIME: {origin.get('mimeType', '?')} | "
+            f"Modified: {origin.get('lastModifiedAt', '?')}\n"
+        )
+    return text
+
+
+async def h_wp_add_file_links(client, args):
+    """Add file links to a work package (bulk, up to 20)."""
+    wp_id = args["work_package_id"]
+    file_links = args.get("file_links", [])
+    if not file_links:
+        return "❌ No file_links provided."
+
+    # Build payload per OP API spec
+    payload = {
+        "_type": "Collection",
+        "_embedded": {
+            "elements": file_links[:20]  # API limit of 20
+        },
+    }
+    r = await client.post(
+        f"/work_packages/{wp_id}/file_links", payload
+    )
+    created = r.get("_embedded", {}).get("elements", [])
+    text = f"✅ {len(created)} file link(s) added to WP #{wp_id}:\n\n"
+    for fl in created:
+        origin = fl.get("originData", {})
+        text += f"- **{origin.get('name', '?')}** (ID: {fl.get('id')})\n"
+    return text
+
+
+async def h_art_get_file_link(client, args):
+    """Get a file link by ID."""
+    r = await client.get(f"/file_links/{args['file_link_id']}")
+    origin = r.get("originData", {})
+    return (
+        f"**File Link #{r.get('id')}:**\n"
+        f"- Name: {origin.get('name', 'N/A')}\n"
+        f"- MIME: {origin.get('mimeType', '?')}\n"
+        f"- Size: {origin.get('size', '?')} bytes\n"
+        f"- Last Modified: {origin.get('lastModifiedAt', '?')}\n"
+        f"- Created By: {origin.get('createdByName', '?')}\n"
+    )
+
+
+async def h_art_open_file_link(client, args):
+    """Get the open location URL for a file link."""
+    r = await client.get(f"/file_links/{args['file_link_id']}/open")
+    return (
+        f"**Open File Link #{args['file_link_id']}:**\n"
+        f"{json.dumps(r, indent=2)[:2000]}"
+    )
+
+
+async def h_art_download_file_link(client, args):
+    """Get the download location URL for a file link."""
+    r = await client.get(f"/file_links/{args['file_link_id']}/download")
+    return (
+        f"**Download File Link #{args['file_link_id']}:**\n"
+        f"{json.dumps(r, indent=2)[:2000]}"
+    )
+
+
+async def h_art_delete_file_link(client, args):
+    """Delete a file link."""
+    await client.delete_resource(f"/file_links/{args['file_link_id']}")
+    return f"✅ File link #{args['file_link_id']} deleted."
+
+
+# ── A6: Custom Field/Option handlers (integration tool) ──────────────
+
+
+async def h_int_get_custom_option(client, args):
+    """Get a custom option (allowed value for list-type custom fields)."""
+    r = await client.get(f"/custom_options/{args['custom_option_id']}")
+    return (
+        f"**Custom Option #{r.get('id')}:**\n"
+        f"- Value: {r.get('value', 'N/A')}\n"
+    )
+
+
+async def h_int_list_custom_field_items(client, args):
+    """List items for a hierarchy/weighted_item_list custom field."""
+    items = await client.get_collection(
+        f"/custom_fields/{args['custom_field_id']}/items"
+    )
+    if not items:
+        return f"No items found for custom field #{args['custom_field_id']}."
+    text = f"**Custom Field #{args['custom_field_id']} Items ({len(items)}):**\n\n"
+    for item in items:
+        text += f"- **{item.get('value', '?')}** (ID: {item.get('id')})\n"
+    return text
+
+
+# ── A7: Schema Introspection handlers (integration tool) ─────────────
+
+
+async def h_int_get_work_package_schema(client, args):
+    """Get the work package schema for a project/type combination."""
+    if "project_id" not in args or "type_id" not in args:
+        return "Both `project_id` and `type_id` are required. Use `project.list_types` to find valid type IDs for a project."
+    pid = args["project_id"]
+    tid = args["type_id"]
+    r = await client.get(f"/work_packages/schemas/{pid}-{tid}")
+    # Extract field names and their types for a useful summary
+    text = f"**WP Schema (Project #{pid}, Type #{tid}):**\n\n"
+    for field_name, field_def in r.items():
+        if field_name.startswith("_") or not isinstance(field_def, dict):
+            continue
+        f_type = field_def.get("type", "?")
+        required = field_def.get("required", False)
+        writable = field_def.get("writable", True)
+        name = field_def.get("name", field_name)
+        text += f"- **{name}** ({field_name}): type={f_type}"
+        if required:
+            text += " [required]"
+        if not writable:
+            text += " [read-only]"
+        # Show allowed values if present
+        allowed = field_def.get("_links", {}).get("allowedValues")
+        if allowed and isinstance(allowed, list) and len(allowed) <= 10:
+            vals = ", ".join(
+                a.get("title", a.get("value", "?")) for a in allowed
+            )
+            text += f" allowed=[{vals}]"
+        text += "\n"
+    return text
+
+
+async def h_int_post_work_package_form(client, args):
+    """Validate a draft WP payload via the form endpoint."""
+    payload = args.get("payload", {})
+    r = await client.post("/work_packages/form", payload)
+    # Form response has _type, payload, schema, validationErrors
+    errors = r.get("_embedded", {}).get("validationErrors", {})
+    schema = r.get("_embedded", {}).get("schema", {})
+    result_payload = r.get("_embedded", {}).get("payload", {})
+
+    text = "**Work Package Form Validation:**\n\n"
+    if errors:
+        text += "**Validation Errors:**\n"
+        for field, err in errors.items():
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            text += f"- {field}: {msg}\n"
+    else:
+        text += "No validation errors.\n"
+
+    text += f"\n**Resolved Payload:**\n{json.dumps(result_payload, indent=2)[:2000]}\n"
+    return text
+
+
+# ── A8: View handlers (query_view tool) ──────────────────────────────
+
+
+async def h_qv_list_views(client, args):
+    """List all views (table, calendar, team planner, gantt)."""
+    items = await client.get_collection("/views?pageSize=100")
+    if not items:
+        return "No views found."
+    text = f"Found {len(items)} view(s):\n\n"
+    for v in items:
+        text += f"- **{v.get('_type', '?')}** (ID: {v.get('id')})\n"
+    return text
+
+
+async def h_qv_get_view(client, args):
+    """Get a single view by ID."""
+    r = await client.get(f"/views/{args['view_id']}")
+    return (
+        f"**View #{r.get('id')}:**\n"
+        f"- Type: {r.get('_type', '?')}\n"
+        f"{json.dumps(r, indent=2)[:2000]}\n"
+    )
+
+
+async def h_qv_create_view(client, args):
+    """Create a new view of specified type."""
+    view_type = args["view_type"]
+    payload = args.get("payload", {})
+    r = await client.post(f"/views/{view_type}", payload)
+    return f"✅ View created: #{r.get('id')} (type: {r.get('_type', view_type)})"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Operation Registry — maps (tool_name, operation) to handler function
+# ═══════════════════════════════════════════════════════════════════════
+
+REGISTRY = {
+    # ── project (9 operations) ──
+    ("project", "list"): h_project_list,
+    ("project", "get"): h_project_get,
+    ("project", "create"): h_project_create,
+    ("project", "update"): h_project_update,
+    ("project", "delete"): h_project_delete,
+    ("project", "list_types"): h_project_list_types,
+    ("project", "list_versions"): h_project_list_versions,
+    ("project", "list_available_assignees"): h_project_list_available_assignees,
+    ("project", "copy"): h_project_copy,
+    ("project", "list_budgets"): h_project_list_budgets,
+    ("project", "get_budget"): h_project_get_budget,
+    # ── work_package (21 operations) ──
+    ("work_package", "list"): h_wp_list,
+    ("work_package", "get"): h_wp_get,
+    ("work_package", "create"): h_wp_create,
+    ("work_package", "update"): h_wp_update,
+    ("work_package", "delete"): h_wp_delete,
+    ("work_package", "set_parent"): h_wp_set_parent,
+    ("work_package", "remove_parent"): h_wp_remove_parent,
+    ("work_package", "list_children"): h_wp_list_children,
+    ("work_package", "list_activities"): h_wp_list_activities,
+    ("work_package", "add_comment"): h_wp_add_comment,
+    ("work_package", "list_attachments"): h_wp_list_attachments,
+    ("work_package", "list_watchers"): h_wp_list_watchers,
+    ("work_package", "add_watcher"): h_wp_add_watcher,
+    ("work_package", "remove_watcher"): h_wp_remove_watcher,
+    ("work_package", "list_relations"): h_wp_list_relations,
+    ("work_package", "create_relation"): h_wp_create_relation,
+    ("work_package", "get_relation"): h_wp_get_relation,
+    ("work_package", "update_relation"): h_wp_update_relation,
+    ("work_package", "delete_relation"): h_wp_delete_relation,
+    ("work_package", "list_available_watchers"): h_wp_list_available_watchers,
+    ("work_package", "list_available_relation_candidates"): h_wp_list_available_relation_candidates,
+    ("work_package", "add_attachment"): h_wp_add_attachment,
+    ("work_package", "list_file_links"): h_wp_list_file_links,
+    ("work_package", "add_file_links"): h_wp_add_file_links,
+    # ── time_entry (6 operations) ──
+    ("time_entry", "list"): h_te_list,
+    ("time_entry", "get"): h_te_get,
+    ("time_entry", "create"): h_te_create,
+    ("time_entry", "update"): h_te_update,
+    ("time_entry", "delete"): h_te_delete,
+    ("time_entry", "list_activities"): h_te_list_activities,
+    # ── membership (7 operations) ──
+    ("membership", "list"): h_mem_list,
+    ("membership", "get"): h_mem_get,
+    ("membership", "create"): h_mem_create,
+    ("membership", "update"): h_mem_update,
+    ("membership", "delete"): h_mem_delete,
+    ("membership", "list_project_members"): h_mem_list_project_members,
+    ("membership", "list_user_projects"): h_mem_list_user_projects,
+    # ── principal (15 operations) ──
+    ("principal", "list_users"): h_principal_list_users,
+    ("principal", "get_user"): h_principal_get_user,
+    ("principal", "create_user"): h_principal_create_user,
+    ("principal", "update_user"): h_principal_update_user,
+    ("principal", "delete_user"): h_principal_delete_user,
+    ("principal", "lock_user"): h_principal_lock_user,
+    ("principal", "unlock_user"): h_principal_unlock_user,
+    ("principal", "list_groups"): h_principal_list_groups,
+    ("principal", "get_group"): h_principal_get_group,
+    ("principal", "create_group"): h_principal_create_group,
+    ("principal", "update_group"): h_principal_update_group,
+    ("principal", "delete_group"): h_principal_delete_group,
+    ("principal", "list_roles"): h_principal_list_roles,
+    ("principal", "get_role"): h_principal_get_role,
+    ("principal", "list_principals"): h_principal_list_principals,
+    # ── version (6 operations) ──
+    ("version", "list"): h_version_list,
+    ("version", "get"): h_version_get,
+    ("version", "create"): h_version_create,
+    ("version", "update"): h_version_update,
+    ("version", "delete"): h_version_delete,
+    ("version", "list_projects"): h_version_list_projects,
+    # ── query_view (8 operations) ──
+    ("query_view", "list_queries"): h_qv_list_queries,
+    ("query_view", "get_query"): h_qv_get_query,
+    ("query_view", "create_query"): h_qv_create_query,
+    ("query_view", "update_query"): h_qv_update_query,
+    ("query_view", "delete_query"): h_qv_delete_query,
+    ("query_view", "star_query"): h_qv_star,
+    ("query_view", "unstar_query"): h_qv_unstar,
+    ("query_view", "get_default_query"): h_qv_get_default,
+    # ── notification (7 operations) ──
+    ("notification", "list"): h_notif_list,
+    ("notification", "get"): h_notif_get,
+    ("notification", "get_detail"): h_notif_get_detail,
+    ("notification", "mark_read"): h_notif_mark_read,
+    ("notification", "mark_unread"): h_notif_mark_unread,
+    ("notification", "mark_all_read"): h_notif_mark_all_read,
+    ("notification", "mark_all_unread"): h_notif_mark_all_unread,
+    # ── artifact (11 operations) ──
+    ("artifact", "list_news"): h_art_list_news,
+    ("artifact", "get_news"): h_art_get_news,
+    ("artifact", "create_news"): h_art_create_news,
+    ("artifact", "update_news"): h_art_update_news,
+    ("artifact", "delete_news"): h_art_delete_news,
+    ("artifact", "get_wiki_page"): h_art_get_wiki_page,
+    ("artifact", "get_document"): h_art_get_document,
+    ("artifact", "list_documents"): h_art_list_documents,
+    ("artifact", "get_meeting"): h_art_get_meeting,
+    ("artifact", "get_attachment"): h_art_get_attachment,
+    ("artifact", "delete_attachment"): h_art_delete_attachment,
+    ("artifact", "get_file_link"): h_art_get_file_link,
+    ("artifact", "open_file_link"): h_art_open_file_link,
+    ("artifact", "download_file_link"): h_art_download_file_link,
+    ("artifact", "delete_file_link"): h_art_delete_file_link,
+    # ── integration (14 operations) ──
+    ("integration", "test_connection"): h_int_test_connection,
+    ("integration", "check_permissions"): h_int_check_permissions,
+    ("integration", "list_statuses"): h_int_list_statuses,
+    ("integration", "get_status"): h_int_get_status,
+    ("integration", "list_priorities"): h_int_list_priorities,
+    ("integration", "get_priority"): h_int_get_priority,
+    ("integration", "list_types"): h_int_list_types,
+    ("integration", "get_type"): h_int_get_type,
+    ("integration", "get_category"): h_int_get_category,
+    ("integration", "list_categories"): h_int_list_categories,
+    ("integration", "get_custom_action"): h_int_get_custom_action,
+    ("integration", "execute_custom_action"): h_int_execute_custom_action,
+    ("integration", "get_configuration"): h_int_get_configuration,
+    ("integration", "render_markdown"): h_int_render_markdown,
+    # A1: Day/Schedule operations
+    ("integration", "list_days"): h_int_list_days,
+    ("integration", "get_day"): h_int_get_day,
+    ("integration", "list_non_working_days"): h_int_list_non_working_days,
+    ("integration", "get_week_schedule"): h_int_get_week_schedule,
+    # A6: Custom Field/Option operations
+    ("integration", "get_custom_option"): h_int_get_custom_option,
+    ("integration", "list_custom_field_items"): h_int_list_custom_field_items,
+    # A7: Schema Introspection operations
+    ("integration", "get_work_package_schema"): h_int_get_work_package_schema,
+    ("integration", "post_work_package_form"): h_int_post_work_package_form,
+    # A8: View operations
+    ("query_view", "list_views"): h_qv_list_views,
+    ("query_view", "get_view"): h_qv_get_view,
+    ("query_view", "create_view"): h_qv_create_view,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tool Definitions — 10 parameterized tools
+# ═══════════════════════════════════════════════════════════════════════
+
+RELATION_TYPE_ENUM = [
+    "blocks",
+    "follows",
+    "precedes",
+    "relates",
+    "duplicates",
+    "includes",
+    "requires",
+    "partof",
+]
+
+TOOL_DEFINITIONS = [
+    Tool(
+        name="project",
+        description="Manage projects: list, get, create, update, delete, list_types, list_versions, list_available_assignees, copy, list_budgets, get_budget",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "get",
+                        "create",
+                        "update",
+                        "delete",
+                        "list_types",
+                        "list_versions",
+                        "list_available_assignees",
+                        "copy",
+                        "list_budgets",
+                        "get_budget",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for get/update/delete/list_types/list_versions/list_available_assignees)",
+                },
+                "source_project_id": {
+                    "type": "integer",
+                    "description": "Source project ID (for copy)",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Project name (for create/update)",
+                },
+                "identifier": {
+                    "type": "string",
+                    "description": "Project identifier (for create/update)",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Project description",
+                },
+                "public": {
+                    "type": "boolean",
+                    "description": "Whether project is public",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Project status",
+                },
+                "parent_id": {
+                    "type": "integer",
+                    "description": "Parent project ID",
+                },
+                "active_only": {
+                    "type": "boolean",
+                    "description": "Show only active projects (for list)",
+                    "default": True,
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Raw payload (for copy)",
+                },
+                "budget_id": {
+                    "type": "integer",
+                    "description": "Budget ID (for get_budget)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="work_package",
+        description=(
+            "Manage work packages: list, get, create, update, delete, "
+            "set_parent, remove_parent, list_children, list_activities, add_comment, "
+            "list_attachments, add_attachment, list_watchers, add_watcher, remove_watcher, "
+            "list_relations, create_relation, get_relation, update_relation, delete_relation, "
+            "list_available_watchers, list_available_relation_candidates, "
+            "list_file_links, add_file_links"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "get",
+                        "create",
+                        "update",
+                        "delete",
+                        "set_parent",
+                        "remove_parent",
+                        "list_children",
+                        "list_activities",
+                        "add_comment",
+                        "list_attachments",
+                        "add_attachment",
+                        "list_watchers",
+                        "add_watcher",
+                        "remove_watcher",
+                        "list_relations",
+                        "create_relation",
+                        "get_relation",
+                        "update_relation",
+                        "delete_relation",
+                        "list_available_watchers",
+                        "list_available_relation_candidates",
+                        "list_file_links",
+                        "add_file_links",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "work_package_id": {
+                    "type": "integer",
+                    "description": "Work package ID",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for list/create)",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Work package title (for create/update)",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description (Markdown supported)",
+                },
+                "type_id": {
+                    "type": "integer",
+                    "description": "Type ID (for create/update)",
+                },
+                "status_id": {
+                    "type": "integer",
+                    "description": "Status ID (for update)",
+                },
+                "priority_id": {
+                    "type": "integer",
+                    "description": "Priority ID",
+                },
+                "assignee_id": {
+                    "type": "integer",
+                    "description": "Assignee user ID",
+                },
+                "percentage_done": {
+                    "type": "integer",
+                    "description": "Completion percentage 0-100",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date YYYY-MM-DD",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": "Due date YYYY-MM-DD",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Date for milestones YYYY-MM-DD",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "closed", "all"],
+                    "description": "Status filter (for list)",
+                    "default": "open",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Pagination offset (for list)",
+                },
+                "page_size": {
+                    "type": "integer",
+                    "description": "Page size (for list, max 100)",
+                },
+                "parent_id": {
+                    "type": "integer",
+                    "description": "Parent WP ID (for set_parent/list_children)",
+                },
+                "include_descendants": {
+                    "type": "boolean",
+                    "description": "Include all descendants (for list_children)",
+                    "default": False,
+                },
+                "user_id": {
+                    "type": "integer",
+                    "description": "User ID (for add_watcher/remove_watcher)",
+                },
+                "comment": {
+                    "type": "string",
+                    "description": "Comment text (for add_comment)",
+                },
+                "from_id": {
+                    "type": "integer",
+                    "description": "Source WP ID (for create_relation)",
+                },
+                "to_id": {
+                    "type": "integer",
+                    "description": "Target WP ID (for create_relation)",
+                },
+                "relation_type": {
+                    "type": "string",
+                    "enum": RELATION_TYPE_ENUM,
+                    "description": "Relation type",
+                },
+                "relation_id": {
+                    "type": "integer",
+                    "description": "Relation ID (for get/update/delete_relation)",
+                },
+                "lag": {
+                    "type": "integer",
+                    "description": "Lag in working days (for relations)",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search query (for list_available_relation_candidates)",
+                },
+                "timestamps": {
+                    "type": "string",
+                    "description": "Comma-separated ISO-8601 timestamps or relative durations for baseline comparison (for list/get). Example: 'P-30D,PT0S'",
+                },
+                "file_name": {
+                    "type": "string",
+                    "description": "File name (for add_attachment)",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "File content as string (for add_attachment)",
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": "MIME type (for add_attachment, default: application/octet-stream)",
+                },
+                "file_links": {
+                    "type": "array",
+                    "description": "Array of file link objects (for add_file_links, max 20)",
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="time_entry",
+        description="Manage time entries: list, get, create, update, delete, list_activities",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "get",
+                        "create",
+                        "update",
+                        "delete",
+                        "list_activities",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "time_entry_id": {
+                    "type": "integer",
+                    "description": "Time entry ID (for get/update/delete)",
+                },
+                "work_package_id": {
+                    "type": "integer",
+                    "description": "Work package ID (for list filter/create)",
+                },
+                "user_id": {
+                    "type": "integer",
+                    "description": "User ID (for list filter)",
+                },
+                "hours": {
+                    "type": "number",
+                    "description": "Hours spent e.g. 2.5 (for create/update)",
+                },
+                "spent_on": {
+                    "type": "string",
+                    "description": "Date YYYY-MM-DD (for create/update)",
+                },
+                "comment": {
+                    "type": "string",
+                    "description": "Comment (for create/update)",
+                },
+                "activity_id": {
+                    "type": "integer",
+                    "description": "Activity ID (for create/update)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="membership",
+        description="Manage memberships: list, get, create, update, delete, list_project_members, list_user_projects",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "get",
+                        "create",
+                        "update",
+                        "delete",
+                        "list_project_members",
+                        "list_user_projects",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "membership_id": {
+                    "type": "integer",
+                    "description": "Membership ID (for get/update/delete)",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for list/create/list_project_members)",
+                },
+                "user_id": {
+                    "type": "integer",
+                    "description": "User ID (for list/create/list_user_projects)",
+                },
+                "group_id": {
+                    "type": "integer",
+                    "description": "Group ID (for create, alternative to user_id)",
+                },
+                "role_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Role IDs (for create/update)",
+                },
+                "role_id": {
+                    "type": "integer",
+                    "description": "Single role ID (for create/update)",
+                },
+                "notification_message": {
+                    "type": "string",
+                    "description": "Notification message",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="principal",
+        description=(
+            "Manage users, groups, roles: list_users, get_user, create_user, "
+            "update_user, delete_user, lock_user, unlock_user, list_groups, get_group, "
+            "create_group, update_group, delete_group, list_roles, get_role, list_principals"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list_users",
+                        "get_user",
+                        "create_user",
+                        "update_user",
+                        "delete_user",
+                        "lock_user",
+                        "unlock_user",
+                        "list_groups",
+                        "get_group",
+                        "create_group",
+                        "update_group",
+                        "delete_group",
+                        "list_roles",
+                        "get_role",
+                        "list_principals",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "user_id": {
+                    "type": "integer",
+                    "description": "User ID",
+                },
+                "group_id": {
+                    "type": "integer",
+                    "description": "Group ID",
+                },
+                "role_id": {
+                    "type": "integer",
+                    "description": "Role ID",
+                },
+                "active_only": {
+                    "type": "boolean",
+                    "description": "Show only active users (for list_users)",
+                    "default": True,
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Raw payload (for create/update user/group)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="version",
+        description="Manage versions/milestones: list, get, create, update, delete, list_projects",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "get",
+                        "create",
+                        "update",
+                        "delete",
+                        "list_projects",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "version_id": {
+                    "type": "integer",
+                    "description": "Version ID (for get/update/delete/list_projects)",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for list/create)",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Version name (for create/update)",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Version description",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date YYYY-MM-DD",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date YYYY-MM-DD",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Version status (open/locked/closed)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="query_view",
+        description=(
+            "Manage saved queries and views: list_queries, get_query, create_query, "
+            "update_query, delete_query, star_query, unstar_query, get_default_query, "
+            "list_views, get_view, create_view"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list_queries",
+                        "get_query",
+                        "create_query",
+                        "update_query",
+                        "delete_query",
+                        "star_query",
+                        "unstar_query",
+                        "get_default_query",
+                        "list_views",
+                        "get_view",
+                        "create_view",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "query_id": {
+                    "type": "integer",
+                    "description": "Query ID",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for get_default_query)",
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Query/view payload (for create/update)",
+                },
+                "view_id": {
+                    "type": "integer",
+                    "description": "View ID (for get_view)",
+                },
+                "view_type": {
+                    "type": "string",
+                    "enum": [
+                        "work_packages_table",
+                        "team_planner",
+                        "work_packages_calendar",
+                        "gantt",
+                    ],
+                    "description": "View type (for create_view)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="notification",
+        description="Manage notifications: list, get, get_detail, mark_read, mark_unread, mark_all_read, mark_all_unread",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "get",
+                        "get_detail",
+                        "mark_read",
+                        "mark_unread",
+                        "mark_all_read",
+                        "mark_all_unread",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "notification_id": {
+                    "type": "integer",
+                    "description": "Notification ID",
+                },
+                "detail_id": {
+                    "type": "integer",
+                    "description": "Detail ID (for get_detail)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="artifact",
+        description=(
+            "Manage news, wiki pages, documents, meetings, attachments, file links: "
+            "list_news, get_news, create_news, update_news, delete_news, "
+            "get_wiki_page, get_document, list_documents, get_meeting, "
+            "get_attachment, delete_attachment, "
+            "get_file_link, open_file_link, download_file_link, delete_file_link"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list_news",
+                        "get_news",
+                        "create_news",
+                        "update_news",
+                        "delete_news",
+                        "get_wiki_page",
+                        "get_document",
+                        "list_documents",
+                        "get_meeting",
+                        "get_attachment",
+                        "delete_attachment",
+                        "get_file_link",
+                        "open_file_link",
+                        "download_file_link",
+                        "delete_file_link",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "news_id": {
+                    "type": "integer",
+                    "description": "News ID",
+                },
+                "wiki_page_id": {
+                    "type": "integer",
+                    "description": "Wiki page ID",
+                },
+                "document_id": {
+                    "type": "integer",
+                    "description": "Document ID",
+                },
+                "meeting_id": {
+                    "type": "integer",
+                    "description": "Meeting ID",
+                },
+                "attachment_id": {
+                    "type": "integer",
+                    "description": "Attachment ID",
+                },
+                "file_link_id": {
+                    "type": "integer",
+                    "description": "File link ID (for get/open/download/delete_file_link)",
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Payload for create/update",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+    Tool(
+        name="integration",
+        description=(
+            "Platform integration: test_connection, check_permissions, "
+            "list_statuses, get_status, list_priorities, get_priority, "
+            "list_types, get_type, get_category, list_categories, "
+            "get_custom_action, execute_custom_action, get_configuration, render_markdown, "
+            "list_days, get_day, list_non_working_days, get_week_schedule, "
+            "get_custom_option, list_custom_field_items, "
+            "get_work_package_schema, post_work_package_form"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "test_connection",
+                        "check_permissions",
+                        "list_statuses",
+                        "get_status",
+                        "list_priorities",
+                        "get_priority",
+                        "list_types",
+                        "get_type",
+                        "get_category",
+                        "list_categories",
+                        "get_custom_action",
+                        "execute_custom_action",
+                        "get_configuration",
+                        "render_markdown",
+                        "list_days",
+                        "get_day",
+                        "list_non_working_days",
+                        "get_week_schedule",
+                        "get_custom_option",
+                        "list_custom_field_items",
+                        "get_work_package_schema",
+                        "post_work_package_form",
+                    ],
+                    "description": "Operation to perform",
+                },
+                "status_id": {
+                    "type": "integer",
+                    "description": "Status ID",
+                },
+                "priority_id": {
+                    "type": "integer",
+                    "description": "Priority ID",
+                },
+                "type_id": {
+                    "type": "integer",
+                    "description": "Type ID",
+                },
+                "category_id": {
+                    "type": "integer",
+                    "description": "Category ID",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for list_categories/list_types)",
+                },
+                "custom_action_id": {
+                    "type": "integer",
+                    "description": "Custom action ID",
+                },
+                "work_package_id": {
+                    "type": "integer",
+                    "description": "Work package ID (for execute_custom_action)",
+                },
+                "lock_version": {
+                    "type": "integer",
+                    "description": "Lock version (for execute_custom_action)",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Markdown text (for render_markdown)",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Date YYYY-MM-DD (for get_day)",
+                },
+                "from_date": {
+                    "type": "string",
+                    "description": "Start date filter YYYY-MM-DD (for list_days/list_non_working_days)",
+                },
+                "to_date": {
+                    "type": "string",
+                    "description": "End date filter YYYY-MM-DD (for list_days/list_non_working_days)",
+                },
+                "working": {
+                    "type": "boolean",
+                    "description": "Filter by working/non-working status (for list_days)",
+                },
+                "custom_option_id": {
+                    "type": "integer",
+                    "description": "Custom option ID (for get_custom_option)",
+                },
+                "custom_field_id": {
+                    "type": "integer",
+                    "description": "Custom field ID (for list_custom_field_items)",
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Draft WP payload (for post_work_package_form)",
+                },
+            },
+            "required": ["operation"],
+        },
+    ),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MCP Server
+# ═══════════════════════════════════════════════════════════════════════
 
 
 class OpenProjectMCPServer:
-    """MCP Server for OpenProject integration"""
+    """MCP Server for OpenProject — 10 consolidated tools, 122 operations."""
 
     def __init__(self):
         self.server = Server("openproject-mcp")
@@ -1144,2067 +3015,101 @@ class OpenProjectMCPServer:
         self._setup_handlers()
 
     def _setup_handlers(self):
-        """Register all MCP handlers"""
-
         @self.server.list_tools()
         async def list_tools() -> List[Tool]:
-            """List available tools"""
-            return [
-                Tool(
-                    name="test_connection",
-                    description="Test the connection to the OpenProject API",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="list_projects",
-                    description="List all OpenProject projects",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "active_only": {
-                                "type": "boolean",
-                                "description": "Show only active projects",
-                                "default": True,
-                            }
-                        },
-                    },
-                ),
-                Tool(
-                    name="list_work_packages",
-                    description="List work packages with optional pagination",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID (optional, for project-specific work packages)",
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "Status filter (open, closed, all)",
-                                "enum": ["open", "closed", "all"],
-                                "default": "open",
-                            },
-                            "offset": {
-                                "type": "integer",
-                                "description": "Starting index for pagination (optional, default: 1)",
-                            },
-                            "page_size": {
-                                "type": "integer",
-                                "description": "Number of results per page (optional, max: 100)",
-                            },
-                        },
-                    },
-                ),
-                Tool(
-                    name="list_types",
-                    description="List available work package types",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID (optional, for project-specific types)",
-                            }
-                        },
-                    },
-                ),
-                Tool(
-                    name="create_work_package",
-                    description="Create a new work package with optional date fields",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            },
-                            "subject": {
-                                "type": "string",
-                                "description": "Work package title",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Description (Markdown supported)",
-                            },
-                            "type_id": {
-                                "type": "integer",
-                                "description": "Type ID (e.g., 1 for Task, 2 for Bug)",
-                            },
-                            "priority_id": {
-                                "type": "integer",
-                                "description": "Priority ID (optional)",
-                            },
-                            "assignee_id": {
-                                "type": "integer",
-                                "description": "Assignee user ID (optional)",
-                            },
-                            "start_date": {
-                                "type": "string",
-                                "description": "Start date in ISO 8601 format: YYYY-MM-DD (optional)",
-                            },
-                            "due_date": {
-                                "type": "string",
-                                "description": "Due date in ISO 8601 format: YYYY-MM-DD (optional)",
-                            },
-                            "date": {
-                                "type": "string",
-                                "description": "Date for milestones in ISO 8601 format: YYYY-MM-DD (optional)",
-                            },
-                        },
-                        "required": ["project_id", "subject", "type_id"],
-                    },
-                ),
-                Tool(
-                    name="list_users",
-                    description="List all users",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "active_only": {
-                                "type": "boolean",
-                                "description": "Show only active users",
-                                "default": True,
-                            }
-                        },
-                    },
-                ),
-                Tool(
-                    name="get_user",
-                    description="Get detailed information about a specific user",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "user_id": {"type": "integer", "description": "User ID"}
-                        },
-                        "required": ["user_id"],
-                    },
-                ),
-                Tool(
-                    name="list_memberships",
-                    description="List project memberships",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID (optional, for project-specific memberships)",
-                            },
-                            "user_id": {
-                                "type": "integer",
-                                "description": "User ID (optional, for user-specific memberships)",
-                            },
-                        },
-                    },
-                ),
-                Tool(
-                    name="list_statuses",
-                    description="List available work package statuses",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="list_priorities",
-                    description="List available work package priorities",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="get_work_package",
-                    description="Get detailed information about a specific work package",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID",
-                            }
-                        },
-                        "required": ["work_package_id"],
-                    },
-                ),
-                Tool(
-                    name="update_work_package",
-                    description="Update an existing work package including dates",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID",
-                            },
-                            "subject": {
-                                "type": "string",
-                                "description": "Work package title (optional)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Description (Markdown supported, optional)",
-                            },
-                            "type_id": {
-                                "type": "integer",
-                                "description": "Type ID (optional)",
-                            },
-                            "status_id": {
-                                "type": "integer",
-                                "description": "Status ID (optional)",
-                            },
-                            "priority_id": {
-                                "type": "integer",
-                                "description": "Priority ID (optional)",
-                            },
-                            "assignee_id": {
-                                "type": "integer",
-                                "description": "Assignee user ID (optional)",
-                            },
-                            "percentage_done": {
-                                "type": "integer",
-                                "description": "Completion percentage (0-100, optional)",
-                            },
-                            "start_date": {
-                                "type": "string",
-                                "description": "Start date in ISO 8601 format: YYYY-MM-DD (optional)",
-                            },
-                            "due_date": {
-                                "type": "string",
-                                "description": "Due date in ISO 8601 format: YYYY-MM-DD (optional)",
-                            },
-                            "date": {
-                                "type": "string",
-                                "description": "Date for milestones in ISO 8601 format: YYYY-MM-DD (optional)",
-                            },
-                        },
-                        "required": ["work_package_id"],
-                    },
-                ),
-                Tool(
-                    name="delete_work_package",
-                    description="Delete a work package",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID",
-                            }
-                        },
-                        "required": ["work_package_id"],
-                    },
-                ),
-                Tool(
-                    name="list_time_entries",
-                    description="List time entries",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID (optional, for work package-specific time entries)",
-                            },
-                            "user_id": {
-                                "type": "integer",
-                                "description": "User ID (optional, for user-specific time entries)",
-                            },
-                        },
-                    },
-                ),
-                Tool(
-                    name="create_time_entry",
-                    description="Create a new time entry",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID",
-                            },
-                            "hours": {
-                                "type": "number",
-                                "description": "Hours spent (e.g., 2.5)",
-                            },
-                            "spent_on": {
-                                "type": "string",
-                                "description": "Date when time was spent (YYYY-MM-DD format)",
-                            },
-                            "comment": {
-                                "type": "string",
-                                "description": "Comment/description (optional)",
-                            },
-                            "activity_id": {
-                                "type": "integer",
-                                "description": "Activity ID (optional)",
-                            },
-                        },
-                        "required": ["work_package_id", "hours", "spent_on"],
-                    },
-                ),
-                Tool(
-                    name="update_time_entry",
-                    description="Update an existing time entry",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "time_entry_id": {
-                                "type": "integer",
-                                "description": "Time entry ID",
-                            },
-                            "hours": {
-                                "type": "number",
-                                "description": "Hours spent (e.g., 2.5, optional)",
-                            },
-                            "spent_on": {
-                                "type": "string",
-                                "description": "Date when time was spent (YYYY-MM-DD format, optional)",
-                            },
-                            "comment": {
-                                "type": "string",
-                                "description": "Comment/description (optional)",
-                            },
-                            "activity_id": {
-                                "type": "integer",
-                                "description": "Activity ID (optional)",
-                            },
-                        },
-                        "required": ["time_entry_id"],
-                    },
-                ),
-                Tool(
-                    name="delete_time_entry",
-                    description="Delete a time entry",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "time_entry_id": {
-                                "type": "integer",
-                                "description": "Time entry ID",
-                            }
-                        },
-                        "required": ["time_entry_id"],
-                    },
-                ),
-                Tool(
-                    name="list_time_entry_activities",
-                    description="List available time entry activities",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="list_versions",
-                    description="List project versions/milestones",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID (optional, for project-specific versions)",
-                            }
-                        },
-                    },
-                ),
-                Tool(
-                    name="create_version",
-                    description="Create a new project version/milestone",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            },
-                            "name": {"type": "string", "description": "Version name"},
-                            "description": {
-                                "type": "string",
-                                "description": "Version description (optional)",
-                            },
-                            "start_date": {
-                                "type": "string",
-                                "description": "Start date (YYYY-MM-DD format, optional)",
-                            },
-                            "end_date": {
-                                "type": "string",
-                                "description": "End date (YYYY-MM-DD format, optional)",
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "Version status (open, locked, closed, optional)",
-                            },
-                        },
-                        "required": ["project_id", "name"],
-                    },
-                ),
-                Tool(
-                    name="check_permissions",
-                    description="Check current user permissions and capabilities",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="create_project",
-                    description="Create a new project",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string", "description": "Project name"},
-                            "identifier": {
-                                "type": "string",
-                                "description": "Project identifier (unique)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Project description (optional)",
-                            },
-                            "public": {
-                                "type": "boolean",
-                                "description": "Whether the project is public (optional)",
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "Project status (optional)",
-                            },
-                            "parent_id": {
-                                "type": "integer",
-                                "description": "Parent project ID (optional)",
-                            },
-                        },
-                        "required": ["name", "identifier"],
-                    },
-                ),
-                Tool(
-                    name="update_project",
-                    description="Update an existing project",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Project name (optional)",
-                            },
-                            "identifier": {
-                                "type": "string",
-                                "description": "Project identifier (optional)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Project description (optional)",
-                            },
-                            "public": {
-                                "type": "boolean",
-                                "description": "Whether the project is public (optional)",
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "Project status (optional)",
-                            },
-                            "parent_id": {
-                                "type": "integer",
-                                "description": "Parent project ID (optional)",
-                            },
-                        },
-                        "required": ["project_id"],
-                    },
-                ),
-                Tool(
-                    name="delete_project",
-                    description="Delete a project",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            }
-                        },
-                        "required": ["project_id"],
-                    },
-                ),
-                Tool(
-                    name="get_project",
-                    description="Get detailed information about a specific project",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            }
-                        },
-                        "required": ["project_id"],
-                    },
-                ),
-                Tool(
-                    name="create_membership",
-                    description="Create a new project membership",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            },
-                            "user_id": {
-                                "type": "integer",
-                                "description": "User ID (required if group_id not provided)",
-                            },
-                            "group_id": {
-                                "type": "integer",
-                                "description": "Group ID (required if user_id not provided)",
-                            },
-                            "role_ids": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Array of role IDs",
-                            },
-                            "role_id": {
-                                "type": "integer",
-                                "description": "Single role ID (alternative to role_ids)",
-                            },
-                            "notification_message": {
-                                "type": "string",
-                                "description": "Optional notification message",
-                            },
-                        },
-                        "required": ["project_id"],
-                    },
-                ),
-                Tool(
-                    name="update_membership",
-                    description="Update an existing membership",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "membership_id": {
-                                "type": "integer",
-                                "description": "Membership ID",
-                            },
-                            "role_ids": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Array of role IDs",
-                            },
-                            "role_id": {
-                                "type": "integer",
-                                "description": "Single role ID (alternative to role_ids)",
-                            },
-                            "notification_message": {
-                                "type": "string",
-                                "description": "Optional notification message",
-                            },
-                        },
-                        "required": ["membership_id"],
-                    },
-                ),
-                Tool(
-                    name="delete_membership",
-                    description="Delete a membership",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "membership_id": {
-                                "type": "integer",
-                                "description": "Membership ID",
-                            }
-                        },
-                        "required": ["membership_id"],
-                    },
-                ),
-                Tool(
-                    name="get_membership",
-                    description="Get detailed information about a specific membership",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "membership_id": {
-                                "type": "integer",
-                                "description": "Membership ID",
-                            }
-                        },
-                        "required": ["membership_id"],
-                    },
-                ),
-                Tool(
-                    name="list_project_members",
-                    description="List all members of a specific project",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "Project ID",
-                            }
-                        },
-                        "required": ["project_id"],
-                    },
-                ),
-                Tool(
-                    name="list_user_projects",
-                    description="List all projects a specific user is assigned to",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "user_id": {"type": "integer", "description": "User ID"}
-                        },
-                        "required": ["user_id"],
-                    },
-                ),
-                Tool(
-                    name="list_roles",
-                    description="List all available roles",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="get_role",
-                    description="Get detailed information about a specific role",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "role_id": {"type": "integer", "description": "Role ID"}
-                        },
-                        "required": ["role_id"],
-                    },
-                ),
-                Tool(
-                    name="set_work_package_parent",
-                    description="Set a parent for a work package (create parent-child relationship)",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID to become a child",
-                            },
-                            "parent_id": {
-                                "type": "integer",
-                                "description": "Work package ID to become the parent",
-                            },
-                        },
-                        "required": ["work_package_id", "parent_id"],
-                    },
-                ),
-                Tool(
-                    name="remove_work_package_parent",
-                    description="Remove parent relationship from a work package (make it top-level)",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Work package ID to remove parent from",
-                            }
-                        },
-                        "required": ["work_package_id"],
-                    },
-                ),
-                Tool(
-                    name="list_work_package_children",
-                    description="List all child work packages of a parent",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "parent_id": {
-                                "type": "integer",
-                                "description": "Parent work package ID",
-                            },
-                            "include_descendants": {
-                                "type": "boolean",
-                                "description": "Include grandchildren and all descendants (default: false)",
-                                "default": False,
-                            },
-                        },
-                        "required": ["parent_id"],
-                    },
-                ),
-                Tool(
-                    name="create_work_package_relation",
-                    description="Create a relationship between work packages",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "from_id": {
-                                "type": "integer",
-                                "description": "Source work package ID",
-                            },
-                            "to_id": {
-                                "type": "integer",
-                                "description": "Target work package ID",
-                            },
-                            "relation_type": {
-                                "type": "string",
-                                "description": "Relation type",
-                                "enum": [
-                                    "blocks",
-                                    "follows",
-                                    "precedes",
-                                    "relates",
-                                    "duplicates",
-                                    "includes",
-                                    "requires",
-                                    "partof",
-                                ],
-                            },
-                            "lag": {
-                                "type": "integer",
-                                "description": "Lag in working days (optional, for follows/precedes)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional description of the relation",
-                            },
-                        },
-                        "required": ["from_id", "to_id", "relation_type"],
-                    },
-                ),
-                Tool(
-                    name="list_work_package_relations",
-                    description="List work package relations with optional filtering",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "work_package_id": {
-                                "type": "integer",
-                                "description": "Filter relations involving this work package ID (optional)",
-                            },
-                            "relation_type": {
-                                "type": "string",
-                                "description": "Filter by relation type (optional)",
-                                "enum": [
-                                    "blocks",
-                                    "follows",
-                                    "precedes",
-                                    "relates",
-                                    "duplicates",
-                                    "includes",
-                                    "requires",
-                                    "partof",
-                                ],
-                            },
-                        },
-                    },
-                ),
-                Tool(
-                    name="update_work_package_relation",
-                    description="Update an existing work package relation",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "relation_id": {
-                                "type": "integer",
-                                "description": "Relation ID",
-                            },
-                            "relation_type": {
-                                "type": "string",
-                                "description": "New relation type (optional)",
-                                "enum": [
-                                    "blocks",
-                                    "follows",
-                                    "precedes",
-                                    "relates",
-                                    "duplicates",
-                                    "includes",
-                                    "requires",
-                                    "partof",
-                                ],
-                            },
-                            "lag": {
-                                "type": "integer",
-                                "description": "Lag in working days (optional, for follows/precedes)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional description of the relation",
-                            },
-                        },
-                        "required": ["relation_id"],
-                    },
-                ),
-                Tool(
-                    name="delete_work_package_relation",
-                    description="Delete a work package relation",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "relation_id": {
-                                "type": "integer",
-                                "description": "Relation ID",
-                            }
-                        },
-                        "required": ["relation_id"],
-                    },
-                ),
-                Tool(
-                    name="get_work_package_relation",
-                    description="Get detailed information about a specific work package relation",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "relation_id": {
-                                "type": "integer",
-                                "description": "Relation ID",
-                            }
-                        },
-                        "required": ["relation_id"],
-                    },
-                ),
-            ]
+            return TOOL_DEFINITIONS
 
         @self.server.call_tool()
-        async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-            """Execute a tool"""
+        async def call_tool(
+            name: str, arguments: Dict[str, Any]
+        ) -> List[TextContent]:
             if not self.client:
                 return [
                     TextContent(
                         type="text",
-                        text="Error: OpenProject Client not initialized. Please set environment variables:\n"
-                        "- OPENPROJECT_URL=https://your-instance.openproject.com\n"
-                        "- OPENPROJECT_API_KEY=your-api-key",
+                        text=(
+                            "Error: OpenProject Client not initialized. "
+                            "Set OPENPROJECT_URL and OPENPROJECT_API_KEY."
+                        ),
+                    )
+                ]
+
+            operation = arguments.get("operation")
+            if not operation:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"❌ Missing 'operation' parameter for tool '{name}'.",
+                    )
+                ]
+
+            handler = REGISTRY.get((name, operation))
+            if not handler:
+                ops = sorted(
+                    op for (t, op) in REGISTRY if t == name
+                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"❌ Unknown operation '{operation}' for tool '{name}'.\n"
+                            f"Available: {', '.join(ops)}"
+                        ),
                     )
                 ]
 
             try:
-                if name == "test_connection":
-                    result = await self.client.test_connection()
-
-                    text = "✅ API connection successful!\n\n"
-                    if self.client.proxy:
-                        text += f"Connected via proxy: {self.client.proxy}\n"
-                    text += f"API Version: {result.get('_type', 'Unknown')}\n"
-                    text += f"Instance Version: {result.get('instanceVersion', 'Unknown')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_projects":
-                    filters = None
-                    if arguments.get("active_only", True):
-                        filters = json.dumps(
-                            [{"active": {"operator": "=", "values": ["t"]}}]
-                        )
-
-                    result = await self.client.get_projects(filters)
-                    projects = result.get("_embedded", {}).get("elements", [])
-
-                    if not projects:
-                        text = "No projects found."
-                    else:
-                        text = f"Found {len(projects)} project(s):\n\n"
-                        for project in projects:
-                            text += f"- **{project['name']}** (ID: {project['id']})\n"
-                            if project.get("description", {}).get("raw"):
-                                text += f"  {project['description']['raw']}\n"
-                            text += f"  Status: {'Active' if project.get('active') else 'Inactive'}\n"
-                            text += f"  Public: {'Yes' if project.get('public') else 'No'}\n\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_work_packages":
-                    project_id = arguments.get("project_id")
-                    status = arguments.get("status", "open")
-                    offset = arguments.get("offset")
-                    page_size = arguments.get("page_size")
-
-                    filters = None
-                    if status == "open":
-                        filters = json.dumps(
-                            [{"status_id": {"operator": "o", "values": None}}]
-                        )
-                    elif status == "closed":
-                        filters = json.dumps(
-                            [{"status_id": {"operator": "c", "values": None}}]
-                        )
-
-                    result = await self.client.get_work_packages(
-                        project_id, filters, offset, page_size
-                    )
-                    work_packages = result.get("_embedded", {}).get("elements", [])
-
-                    # Get pagination info from result
-                    total = result.get("total", len(work_packages))
-                    count = result.get("count", len(work_packages))
-                    page_size_actual = result.get("pageSize", page_size or 20)
-                    offset_actual = result.get("offset", offset or 1)
-
-                    if not work_packages:
-                        text = "No work packages found."
-                    else:
-                        # Show pagination info
-                        text = f"Found {total} work package(s) (showing {count} results"
-                        if offset or page_size:
-                            text += f", offset: {offset_actual}, pageSize: {page_size_actual}"
-                        text += "):\n\n"
-
-                        for wp in work_packages:
-                            text += f"- **{wp.get('subject', 'No title')}** (#{wp.get('id', 'N/A')})\n"
-
-                            if "_embedded" in wp:
-                                embedded = wp["_embedded"]
-                                if "type" in embedded:
-                                    text += f"  Type: {embedded['type'].get('name', 'Unknown')}\n"
-                                if "status" in embedded:
-                                    text += f"  Status: {embedded['status'].get('name', 'Unknown')}\n"
-                                if "project" in embedded:
-                                    text += f"  Project: {embedded['project'].get('name', 'Unknown')}\n"
-                                if "assignee" in embedded and embedded["assignee"]:
-                                    text += f"  Assignee: {embedded['assignee'].get('name', 'Unassigned')}\n"
-
-                            if "percentageDone" in wp:
-                                text += f"  Progress: {wp['percentageDone']}%\n"
-
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_types":
-                    result = await self.client.get_types(arguments.get("project_id"))
-                    types = result.get("_embedded", {}).get("elements", [])
-
-                    if not types:
-                        text = "No work package types found."
-                    else:
-                        text = "Available work package types:\n\n"
-                        for type_item in types:
-                            text += f"- **{type_item.get('name', 'Unnamed')}** (ID: {type_item.get('id', 'N/A')})\n"
-                            if type_item.get("isDefault"):
-                                text += "  ✓ Default type\n"
-                            if type_item.get("isMilestone"):
-                                text += "  ✓ Milestone\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "create_work_package":
-                    try:
-                        data = {
-                            "project": arguments["project_id"],
-                            "subject": arguments["subject"],
-                            "type": arguments["type_id"],
-                        }
-
-                        # Add optional fields
-                        for field in ["description", "priority_id", "assignee_id"]:
-                            if field in arguments:
-                                data[field] = arguments[field]
-
-                        # Add date fields (map from snake_case to camelCase)
-                        if "start_date" in arguments:
-                            data["startDate"] = arguments["start_date"]
-                        if "due_date" in arguments:
-                            data["dueDate"] = arguments["due_date"]
-                        if "date" in arguments:
-                            data["date"] = arguments["date"]
-
-                        result = await self.client.create_work_package(data)
-
-                        text = f"✅ Work package created successfully:\n\n"
-                        text += f"- **Title**: {result.get('subject', 'N/A')}\n"
-                        text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-
-                        if "_embedded" in result:
-                            embedded = result["_embedded"]
-                            if "type" in embedded:
-                                text += f"- **Type**: {embedded['type'].get('name', 'Unknown')}\n"
-                            if "status" in embedded:
-                                text += f"- **Status**: {embedded['status'].get('name', 'Unknown')}\n"
-                            if "project" in embedded:
-                                text += f"- **Project**: {embedded['project'].get('name', 'Unknown')}\n"
-
-                        return [TextContent(type="text", text=text)]
-
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "403" in error_msg:
-                            # Check user permissions for better error message
-                            try:
-                                user_info = await self.client.check_permissions()
-                                text = f"❌ Permission Error: Cannot create work packages.\n\n"
-                                text += f"**Current User**: {user_info.get('name', 'Unknown')}\n"
-                                text += f"**Admin**: {'Yes' if user_info.get('admin') else 'No'}\n\n"
-                                text += "**Possible Solutions:**\n"
-                                text += "1. Contact your OpenProject administrator to grant work package creation permissions\n"
-                                text += "2. Ensure you have 'Create work packages' permission in the target project\n"
-                                text += "3. Check if the project allows work package creation\n"
-                                text += f"4. Verify project ID {arguments['project_id']} exists and you have access\n\n"
-                                text += f"**Technical Error**: {error_msg}"
-                                return [TextContent(type="text", text=text)]
-                            except:
-                                pass
-
-                        # Default error handling
-                        text = f"❌ Failed to create work package: {error_msg}"
-                        return [TextContent(type="text", text=text)]
-
-                elif name == "list_users":
-                    filters = None
-                    if arguments.get("active_only", True):
-                        filters = json.dumps(
-                            [{"status": {"operator": "=", "values": ["active"]}}]
-                        )
-
-                    result = await self.client.get_users(filters)
-                    users = result.get("_embedded", {}).get("elements", [])
-
-                    if not users:
-                        text = "No users found."
-                    else:
-                        text = f"Found {len(users)} user(s):\n\n"
-                        for user in users:
-                            text += f"- **{user.get('name', 'Unnamed')}** (ID: {user.get('id', 'N/A')})\n"
-                            text += f"  Email: {user.get('email', 'N/A')}\n"
-                            text += f"  Status: {user.get('status', 'Unknown')}\n"
-                            if user.get("admin"):
-                                text += "  ✓ Administrator\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "get_user":
-                    user_id = arguments["user_id"]
-                    result = await self.client.get_user(user_id)
-
-                    text = f"**User Details:**\n\n"
-                    text += f"- **Name**: {result.get('name', 'N/A')}\n"
-                    text += f"- **ID**: {result.get('id', 'N/A')}\n"
-                    text += f"- **Email**: {result.get('email', 'N/A')}\n"
-                    text += f"- **Status**: {result.get('status', 'Unknown')}\n"
-                    text += f"- **Language**: {result.get('language', 'N/A')}\n"
-                    text += f"- **Admin**: {'Yes' if result.get('admin') else 'No'}\n"
-                    text += f"- **Created**: {result.get('createdAt', 'N/A')}\n"
-                    text += f"- **Updated**: {result.get('updatedAt', 'N/A')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_memberships":
-                    project_id = arguments.get("project_id")
-                    user_id = arguments.get("user_id")
-
-                    try:
-                        result = await self.client.get_memberships(project_id, user_id)
-                        memberships = result.get("_embedded", {}).get("elements", [])
-
-                        if not memberships:
-                            filter_info = []
-                            if project_id:
-                                filter_info.append(f"project {project_id}")
-                            if user_id:
-                                filter_info.append(f"user {user_id}")
-                            filter_text = (
-                                f" for {' and '.join(filter_info)}"
-                                if filter_info
-                                else ""
-                            )
-                            text = f"No memberships found{filter_text}."
-                        else:
-                            filter_info = []
-                            if project_id:
-                                filter_info.append(f"project {project_id}")
-                            if user_id:
-                                filter_info.append(f"user {user_id}")
-                            filter_text = (
-                                f" ({' and '.join(filter_info)})" if filter_info else ""
-                            )
-
-                            text = f"Found {len(memberships)} membership(s){filter_text}:\n\n"
-                            for membership in memberships:
-                                text += f"- **Membership ID**: {membership.get('id', 'N/A')}\n"
-
-                                if "_embedded" in membership:
-                                    embedded = membership["_embedded"]
-                                    if "user" in embedded:
-                                        text += f"  User: {embedded['user'].get('name', 'Unknown')}\n"
-                                    if "project" in embedded:
-                                        text += f"  Project: {embedded['project'].get('name', 'Unknown')}\n"
-                                    if "roles" in embedded:
-                                        roles = [
-                                            role.get("name", "Unknown")
-                                            for role in embedded["roles"]
-                                        ]
-                                        text += f"  Roles: {', '.join(roles)}\n"
-                                text += "\n"
-
-                        return [TextContent(type="text", text=text)]
-
-                    except Exception as e:
-                        error_msg = str(e)
-                        if user_id and "user_id" in arguments:
-                            text = f"⚠️ User ID filtering may not be supported in this OpenProject instance.\n\n"
-                            text += f"**Error with user_id={user_id}**: {error_msg}\n\n"
-                            text += "**Workaround**: Try using `list_memberships` without user_id filter, then manually filter results.\n\n"
-                            text += "**Alternative**: Use `list_users` to get user details, then check individual project memberships."
-                        else:
-                            text = f"❌ Failed to retrieve memberships: {error_msg}"
-
-                        return [TextContent(type="text", text=text)]
-
-                elif name == "list_statuses":
-                    result = await self.client.get_statuses()
-                    statuses = result.get("_embedded", {}).get("elements", [])
-
-                    if not statuses:
-                        text = "No statuses found."
-                    else:
-                        text = "Available work package statuses:\n\n"
-                        for status in statuses:
-                            text += f"- **{status.get('name', 'Unnamed')}** (ID: {status.get('id', 'N/A')})\n"
-                            text += f"  Position: {status.get('position', 'N/A')}\n"
-                            if status.get("isDefault"):
-                                text += "  ✓ Default status\n"
-                            if status.get("isClosed"):
-                                text += "  ✓ Closed status\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_priorities":
-                    result = await self.client.get_priorities()
-                    priorities = result.get("_embedded", {}).get("elements", [])
-
-                    if not priorities:
-                        text = "No priorities found."
-                    else:
-                        text = "Available work package priorities:\n\n"
-                        for priority in priorities:
-                            text += f"- **{priority.get('name', 'Unnamed')}** (ID: {priority.get('id', 'N/A')})\n"
-                            text += f"  Position: {priority.get('position', 'N/A')}\n"
-                            if priority.get("isDefault"):
-                                text += "  ✓ Default priority\n"
-                            if priority.get("isActive"):
-                                text += "  ✓ Active\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "get_work_package":
-                    work_package_id = arguments["work_package_id"]
-                    result = await self.client.get_work_package(work_package_id)
-
-                    text = f"**Work Package Details:**\n\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-                    text += f"- **Subject**: {result.get('subject', 'N/A')}\n"
-                    text += f"- **Progress**: {result.get('percentageDone', 0)}%\n"
-                    text += f"- **Created**: {result.get('createdAt', 'N/A')}\n"
-                    text += f"- **Updated**: {result.get('updatedAt', 'N/A')}\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "type" in embedded:
-                            text += f"- **Type**: {embedded['type'].get('name', 'Unknown')}\n"
-                        if "status" in embedded:
-                            text += f"- **Status**: {embedded['status'].get('name', 'Unknown')}\n"
-                        if "priority" in embedded:
-                            text += f"- **Priority**: {embedded['priority'].get('name', 'Unknown')}\n"
-                        if "project" in embedded:
-                            text += f"- **Project**: {embedded['project'].get('name', 'Unknown')}\n"
-                        if "assignee" in embedded and embedded["assignee"]:
-                            text += f"- **Assignee**: {embedded['assignee'].get('name', 'Unassigned')}\n"
-                        else:
-                            text += f"- **Assignee**: Unassigned\n"
-
-                    if result.get("description", {}).get("raw"):
-                        text += f"\n**Description:**\n{result['description']['raw']}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "update_work_package":
-                    work_package_id = arguments["work_package_id"]
-
-                    # Prepare update data
-                    update_data = {}
-                    for field in [
-                        "subject",
-                        "description",
-                        "type_id",
-                        "status_id",
-                        "priority_id",
-                        "assignee_id",
-                        "percentage_done",
-                    ]:
-                        if field in arguments:
-                            update_data[field] = arguments[field]
-
-                    # Add date fields (map from snake_case to camelCase)
-                    if "start_date" in arguments:
-                        update_data["startDate"] = arguments["start_date"]
-                    if "due_date" in arguments:
-                        update_data["dueDate"] = arguments["due_date"]
-                    if "date" in arguments:
-                        update_data["date"] = arguments["date"]
-
-                    if not update_data:
-                        return [
-                            TextContent(
-                                type="text", text="❌ No fields provided to update."
-                            )
-                        ]
-
-                    result = await self.client.update_work_package(
-                        work_package_id, update_data
-                    )
-
-                    text = (
-                        f"✅ Work package #{work_package_id} updated successfully:\n\n"
-                    )
-                    text += f"- **Subject**: {result.get('subject', 'N/A')}\n"
-                    text += f"- **Progress**: {result.get('percentageDone', 0)}%\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "type" in embedded:
-                            text += f"- **Type**: {embedded['type'].get('name', 'Unknown')}\n"
-                        if "status" in embedded:
-                            text += f"- **Status**: {embedded['status'].get('name', 'Unknown')}\n"
-                        if "priority" in embedded:
-                            text += f"- **Priority**: {embedded['priority'].get('name', 'Unknown')}\n"
-                        if "assignee" in embedded and embedded["assignee"]:
-                            text += f"- **Assignee**: {embedded['assignee'].get('name', 'Unassigned')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "delete_work_package":
-                    work_package_id = arguments["work_package_id"]
-
-                    success = await self.client.delete_work_package(work_package_id)
-
-                    if success:
-                        text = (
-                            f"✅ Work package #{work_package_id} deleted successfully."
-                        )
-                    else:
-                        text = f"❌ Failed to delete work package #{work_package_id}."
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_time_entries":
-                    filters = []
-
-                    # Add filters based on arguments
-                    if "work_package_id" in arguments:
-                        filters.append(
-                            {
-                                "workPackage": {
-                                    "operator": "=",
-                                    "values": [str(arguments["work_package_id"])],
-                                }
-                            }
-                        )
-                    if "user_id" in arguments:
-                        filters.append(
-                            {
-                                "user": {
-                                    "operator": "=",
-                                    "values": [str(arguments["user_id"])],
-                                }
-                            }
-                        )
-
-                    filter_string = json.dumps(filters) if filters else None
-                    result = await self.client.get_time_entries(filter_string)
-                    time_entries = result.get("_embedded", {}).get("elements", [])
-
-                    if not time_entries:
-                        text = "No time entries found."
-                    else:
-                        text = f"Found {len(time_entries)} time entrie(s):\n\n"
-                        for entry in time_entries:
-                            # Parse hours from ISO duration format (PT2.5H)
-                            hours_str = entry.get("hours", "PT0H")
-                            hours = (
-                                hours_str.replace("PT", "").replace("H", "")
-                                if "PT" in hours_str
-                                else "0"
-                            )
-
-                            text += f"- **Time Entry #{entry.get('id', 'N/A')}**\n"
-                            text += f"  Hours: {hours}\n"
-                            text += f"  Date: {entry.get('spentOn', 'N/A')}\n"
-
-                            if "_embedded" in entry:
-                                embedded = entry["_embedded"]
-                                if "workPackage" in embedded:
-                                    text += f"  Work Package: {embedded['workPackage'].get('subject', 'Unknown')}\n"
-                                if "user" in embedded:
-                                    text += f"  User: {embedded['user'].get('name', 'Unknown')}\n"
-                                if "activity" in embedded:
-                                    text += f"  Activity: {embedded['activity'].get('name', 'Unknown')}\n"
-
-                            if entry.get("comment", {}).get("raw"):
-                                text += f"  Comment: {entry['comment']['raw']}\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "create_time_entry":
-                    data = {
-                        "work_package_id": arguments["work_package_id"],
-                        "hours": arguments["hours"],
-                        "spent_on": arguments["spent_on"],
-                    }
-
-                    # Add optional fields
-                    for field in ["comment", "activity_id"]:
-                        if field in arguments:
-                            data[field] = arguments[field]
-
-                    result = await self.client.create_time_entry(data)
-
-                    # Parse hours from ISO duration format
-                    hours_str = result.get("hours", "PT0H")
-                    hours = (
-                        hours_str.replace("PT", "").replace("H", "")
-                        if "PT" in hours_str
-                        else "0"
-                    )
-
-                    text = f"✅ Time entry created successfully:\n\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-                    text += f"- **Hours**: {hours}\n"
-                    text += f"- **Date**: {result.get('spentOn', 'N/A')}\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "workPackage" in embedded:
-                            text += f"- **Work Package**: {embedded['workPackage'].get('subject', 'Unknown')}\n"
-                        if "activity" in embedded:
-                            text += f"- **Activity**: {embedded['activity'].get('name', 'Unknown')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "update_time_entry":
-                    time_entry_id = arguments["time_entry_id"]
-
-                    # Prepare update data
-                    update_data = {}
-                    for field in ["hours", "spent_on", "comment", "activity_id"]:
-                        if field in arguments:
-                            update_data[field] = arguments[field]
-
-                    if not update_data:
-                        return [
-                            TextContent(
-                                type="text", text="❌ No fields provided to update."
-                            )
-                        ]
-
-                    result = await self.client.update_time_entry(
-                        time_entry_id, update_data
-                    )
-
-                    # Parse hours from ISO duration format
-                    hours_str = result.get("hours", "PT0H")
-                    hours = (
-                        hours_str.replace("PT", "").replace("H", "")
-                        if "PT" in hours_str
-                        else "0"
-                    )
-
-                    text = f"✅ Time entry #{time_entry_id} updated successfully:\n\n"
-                    text += f"- **Hours**: {hours}\n"
-                    text += f"- **Date**: {result.get('spentOn', 'N/A')}\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "activity" in embedded:
-                            text += f"- **Activity**: {embedded['activity'].get('name', 'Unknown')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "delete_time_entry":
-                    time_entry_id = arguments["time_entry_id"]
-
-                    success = await self.client.delete_time_entry(time_entry_id)
-
-                    if success:
-                        text = f"✅ Time entry #{time_entry_id} deleted successfully."
-                    else:
-                        text = f"❌ Failed to delete time entry #{time_entry_id}."
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_time_entry_activities":
-                    try:
-                        result = await self.client.get_time_entry_activities()
-                        activities = result.get("_embedded", {}).get("elements", [])
-
-                        if not activities:
-                            text = "No time entry activities found."
-                        else:
-                            text = "Available time entry activities:\n\n"
-                            for activity in activities:
-                                text += f"- **{activity.get('name', 'Unnamed')}** (ID: {activity.get('id', 'N/A')})\n"
-                                if activity.get("position"):
-                                    text += f"  Position: {activity.get('position')}\n"
-                                if activity.get("isDefault"):
-                                    text += "  ✓ Default activity\n"
-                                text += "\n"
-
-                        return [TextContent(type="text", text=text)]
-
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "404" in error_msg:
-                            # Provide fallback with discovered activity IDs
-                            text = "⚠️ Time entry activities endpoint not available, but activities can still be used!\n\n"
-                            text += (
-                                "**Available Time Entry Activities (Discovered):**\n\n"
-                            )
-                            text += "- **Management** (ID: 1)\n"
-                            text += "  Administrative and planning tasks\n\n"
-                            text += "- **Specification** (ID: 2)\n"
-                            text += "  Requirements and documentation\n\n"
-                            text += "- **Development** (ID: 3)\n"
-                            text += "  Coding and implementation\n\n"
-                            text += "- **Testing** (ID: 4)\n"
-                            text += "  Quality assurance and testing\n\n"
-                            text += "**Usage**: Use these activity IDs when creating time entries with the `activity_id` parameter.\n\n"
-                            text += "**Example**: `create_time_entry` with `activity_id: 3` for Development work\n\n"
-                            text += f"**Technical Note**: Endpoint returned 404, but activities are functional: {error_msg}"
-                        else:
-                            text = f"❌ Failed to retrieve time entry activities: {error_msg}"
-
-                        return [TextContent(type="text", text=text)]
-
-                elif name == "list_versions":
-                    project_id = arguments.get("project_id")
-                    result = await self.client.get_versions(project_id)
-                    versions = result.get("_embedded", {}).get("elements", [])
-
-                    if not versions:
-                        text = "No versions found."
-                    else:
-                        text = f"Found {len(versions)} version(s):\n\n"
-                        for version in versions:
-                            text += f"- **{version.get('name', 'Unnamed')}** (ID: {version.get('id', 'N/A')})\n"
-                            text += f"  Status: {version.get('status', 'Unknown')}\n"
-
-                            if version.get("startDate"):
-                                text += f"  Start Date: {version.get('startDate')}\n"
-                            if version.get("endDate"):
-                                text += f"  End Date: {version.get('endDate')}\n"
-
-                            if (
-                                "_embedded" in version
-                                and "definingProject" in version["_embedded"]
-                            ):
-                                text += f"  Project: {version['_embedded']['definingProject'].get('name', 'Unknown')}\n"
-
-                            if version.get("description", {}).get("raw"):
-                                text += (
-                                    f"  Description: {version['description']['raw']}\n"
-                                )
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "create_version":
-                    project_id = arguments["project_id"]
-
-                    data = {"name": arguments["name"]}
-
-                    # Add optional fields
-                    for field in ["description", "start_date", "end_date", "status"]:
-                        if field in arguments:
-                            data[field] = arguments[field]
-
-                    result = await self.client.create_version(project_id, data)
-
-                    text = f"✅ Version created successfully:\n\n"
-                    text += f"- **Name**: {result.get('name', 'N/A')}\n"
-                    text += f"- **ID**: {result.get('id', 'N/A')}\n"
-                    text += f"- **Status**: {result.get('status', 'Unknown')}\n"
-
-                    if result.get("startDate"):
-                        text += f"- **Start Date**: {result.get('startDate')}\n"
-                    if result.get("endDate"):
-                        text += f"- **End Date**: {result.get('endDate')}\n"
-
-                    if (
-                        "_embedded" in result
-                        and "definingProject" in result["_embedded"]
-                    ):
-                        text += f"- **Project**: {result['_embedded']['definingProject'].get('name', 'Unknown')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "check_permissions":
-                    user_info = await self.client.check_permissions()
-
-                    if not user_info:
-                        text = "❌ Unable to retrieve user permissions."
-                    else:
-                        text = f"**Current User Permissions:**\n\n"
-                        text += f"- **Name**: {user_info.get('name', 'Unknown')}\n"
-                        text += f"- **ID**: {user_info.get('id', 'N/A')}\n"
-                        text += f"- **Email**: {user_info.get('email', 'N/A')}\n"
-                        text += f"- **Status**: {user_info.get('status', 'Unknown')}\n"
-                        text += f"- **Administrator**: {'Yes' if user_info.get('admin') else 'No'}\n"
-                        text += f"- **Language**: {user_info.get('language', 'N/A')}\n"
-                        text += f"- **Created**: {user_info.get('createdAt', 'N/A')}\n"
-
-                        # Check for specific permission-related links
-                        if "_links" in user_info:
-                            links = user_info["_links"]
-                            text += f"\n**Available Actions:**\n"
-                            for link_name, link_info in links.items():
-                                if link_name not in ["self", "showUser"]:
-                                    text += f"- {link_name}: Available\n"
-
-                        text += f"\n**Tip**: Use this information to understand why certain operations may fail due to insufficient permissions."
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "create_project":
-                    data = {
-                        "name": arguments["name"],
-                        "identifier": arguments["identifier"],
-                    }
-
-                    # Add optional fields
-                    for field in ["description", "public", "status", "parent_id"]:
-                        if field in arguments:
-                            data[field] = arguments[field]
-
-                    result = await self.client.create_project(data)
-
-                    text = f"✅ Project created successfully:\n\n"
-                    text += f"- **Name**: {result.get('name', 'N/A')}\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-                    text += f"- **Identifier**: {result.get('identifier', 'N/A')}\n"
-                    text += f"- **Public**: {'Yes' if result.get('public') else 'No'}\n"
-                    text += f"- **Status**: {result.get('status', 'N/A')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "update_project":
-                    project_id = arguments["project_id"]
-
-                    # Prepare update data
-                    update_data = {}
-                    for field in [
-                        "name",
-                        "identifier",
-                        "description",
-                        "public",
-                        "status",
-                        "parent_id",
-                    ]:
-                        if field in arguments:
-                            update_data[field] = arguments[field]
-
-                    if not update_data:
-                        return [
-                            TextContent(
-                                type="text", text="❌ No fields provided to update."
-                            )
-                        ]
-
-                    result = await self.client.update_project(project_id, update_data)
-
-                    text = f"✅ Project #{project_id} updated successfully:\n\n"
-                    text += f"- **Name**: {result.get('name', 'N/A')}\n"
-                    text += f"- **Identifier**: {result.get('identifier', 'N/A')}\n"
-                    text += f"- **Public**: {'Yes' if result.get('public') else 'No'}\n"
-                    text += f"- **Status**: {result.get('status', 'N/A')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "delete_project":
-                    project_id = arguments["project_id"]
-
-                    success = await self.client.delete_project(project_id)
-
-                    if success:
-                        text = f"✅ Project #{project_id} deleted successfully."
-                    else:
-                        text = f"❌ Failed to delete project #{project_id}."
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "get_project":
-                    project_id = arguments["project_id"]
-                    result = await self.client.get_project(project_id)
-
-                    text = f"**Project Details:**\n\n"
-                    text += f"- **Name**: {result.get('name', 'N/A')}\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-                    text += f"- **Identifier**: {result.get('identifier', 'N/A')}\n"
-                    text += f"- **Description**: {result.get('description', {}).get('raw', 'No description') if result.get('description') else 'No description'}\n"
-                    text += f"- **Public**: {'Yes' if result.get('public') else 'No'}\n"
-                    text += f"- **Status**: {result.get('status', 'N/A')}\n"
-                    text += f"- **Created**: {result.get('createdAt', 'N/A')}\n"
-                    text += f"- **Updated**: {result.get('updatedAt', 'N/A')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "create_membership":
-                    data = {"project_id": arguments["project_id"]}
-
-                    # Add user or group
-                    if "user_id" in arguments:
-                        data["user_id"] = arguments["user_id"]
-                    elif "group_id" in arguments:
-                        data["group_id"] = arguments["group_id"]
-                    else:
-                        return [
-                            TextContent(
-                                type="text",
-                                text="❌ Either user_id or group_id is required.",
-                            )
-                        ]
-
-                    # Add roles
-                    if "role_ids" in arguments:
-                        data["role_ids"] = arguments["role_ids"]
-                    elif "role_id" in arguments:
-                        data["role_id"] = arguments["role_id"]
-                    else:
-                        return [
-                            TextContent(
-                                type="text",
-                                text="❌ Either role_ids or role_id is required.",
-                            )
-                        ]
-
-                    # Add optional fields
-                    if "notification_message" in arguments:
-                        data["notification_message"] = arguments["notification_message"]
-
-                    result = await self.client.create_membership(data)
-
-                    text = f"✅ Membership created successfully:\n\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "project" in embedded:
-                            text += f"- **Project**: {embedded['project'].get('name', 'Unknown')}\n"
-                        if "principal" in embedded:
-                            text += f"- **User/Group**: {embedded['principal'].get('name', 'Unknown')}\n"
-                        if "roles" in embedded:
-                            roles = [
-                                role.get("name", "Unknown")
-                                for role in embedded["roles"]
-                            ]
-                            text += f"- **Roles**: {', '.join(roles)}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "update_membership":
-                    membership_id = arguments["membership_id"]
-
-                    # Prepare update data
-                    update_data = {}
-                    if "role_ids" in arguments:
-                        update_data["role_ids"] = arguments["role_ids"]
-                    elif "role_id" in arguments:
-                        update_data["role_id"] = arguments["role_id"]
-
-                    if "notification_message" in arguments:
-                        update_data["notification_message"] = arguments[
-                            "notification_message"
-                        ]
-
-                    if not update_data:
-                        return [
-                            TextContent(
-                                type="text", text="❌ No fields provided to update."
-                            )
-                        ]
-
-                    result = await self.client.update_membership(
-                        membership_id, update_data
-                    )
-
-                    text = f"✅ Membership #{membership_id} updated successfully:\n\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "roles" in embedded:
-                            roles = [
-                                role.get("name", "Unknown")
-                                for role in embedded["roles"]
-                            ]
-                            text += f"- **Roles**: {', '.join(roles)}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "delete_membership":
-                    membership_id = arguments["membership_id"]
-
-                    success = await self.client.delete_membership(membership_id)
-
-                    if success:
-                        text = f"✅ Membership #{membership_id} deleted successfully."
-                    else:
-                        text = f"❌ Failed to delete membership #{membership_id}."
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "get_membership":
-                    membership_id = arguments["membership_id"]
-                    result = await self.client.get_membership(membership_id)
-
-                    text = f"**Membership Details:**\n\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "project" in embedded:
-                            text += f"- **Project**: {embedded['project'].get('name', 'Unknown')}\n"
-                        if "principal" in embedded:
-                            text += f"- **User/Group**: {embedded['principal'].get('name', 'Unknown')}\n"
-                        if "roles" in embedded:
-                            roles = [
-                                role.get("name", "Unknown")
-                                for role in embedded["roles"]
-                            ]
-                            text += f"- **Roles**: {', '.join(roles)}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_project_members":
-                    project_id = arguments["project_id"]
-
-                    # Filter memberships by project
-                    filters = json.dumps(
-                        [{"project": {"operator": "=", "values": [str(project_id)]}}]
-                    )
-                    result = await self.client.get_memberships(project_id=project_id)
-                    memberships = result.get("_embedded", {}).get("elements", [])
-
-                    if not memberships:
-                        text = f"No members found for project #{project_id}."
-                    else:
-                        text = f"**Project #{project_id} Members ({len(memberships)}):**\n\n"
-                        for membership in memberships:
-                            if "_embedded" in membership:
-                                embedded = membership["_embedded"]
-                                user_name = "Unknown"
-                                roles = []
-
-                                if "principal" in embedded:
-                                    user_name = embedded["principal"].get(
-                                        "name", "Unknown"
-                                    )
-                                if "roles" in embedded:
-                                    roles = [
-                                        role.get("name", "Unknown")
-                                        for role in embedded["roles"]
-                                    ]
-
-                                text += f"- **{user_name}**: {', '.join(roles)}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_user_projects":
-                    user_id = arguments["user_id"]
-
-                    # Filter memberships by user
-                    result = await self.client.get_memberships(user_id=user_id)
-                    memberships = result.get("_embedded", {}).get("elements", [])
-
-                    if not memberships:
-                        text = f"No projects found for user #{user_id}."
-                    else:
-                        text = f"**User #{user_id} Projects ({len(memberships)}):**\n\n"
-                        for membership in memberships:
-                            if "_embedded" in membership:
-                                embedded = membership["_embedded"]
-                                project_name = "Unknown"
-                                roles = []
-
-                                if "project" in embedded:
-                                    project_name = embedded["project"].get(
-                                        "name", "Unknown"
-                                    )
-                                if "roles" in embedded:
-                                    roles = [
-                                        role.get("name", "Unknown")
-                                        for role in embedded["roles"]
-                                    ]
-
-                                text += f"- **{project_name}**: {', '.join(roles)}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_roles":
-                    result = await self.client.get_roles()
-                    roles = result.get("_embedded", {}).get("elements", [])
-
-                    if not roles:
-                        text = "No roles found."
-                    else:
-                        text = f"Available roles ({len(roles)}):\n\n"
-                        for role in roles:
-                            text += f"- **{role.get('name', 'Unnamed')}** (ID: {role.get('id', 'N/A')})\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "get_role":
-                    role_id = arguments["role_id"]
-                    result = await self.client.get_role(role_id)
-
-                    text = f"**Role Details:**\n\n"
-                    text += f"- **Name**: {result.get('name', 'N/A')}\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-
-                    # Add any additional role information if available
-                    if "permissions" in result:
-                        permissions = result["permissions"]
-                        if permissions:
-                            text += f"- **Permissions**: {len(permissions)} permissions assigned\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "set_work_package_parent":
-                    work_package_id = arguments["work_package_id"]
-                    parent_id = arguments["parent_id"]
-
-                    result = await self.client.set_work_package_parent(
-                        work_package_id, parent_id
-                    )
-
-                    text = f"✅ Parent relationship created successfully:\n\n"
-                    text += f"- **Child Work Package**: #{work_package_id}\n"
-                    text += f"- **Parent Work Package**: #{parent_id}\n"
-                    text += f"- **Subject**: {result.get('subject', 'N/A')}\n"
-
-                    if "_links" in result and "parent" in result["_links"]:
-                        parent_href = result["_links"]["parent"].get("href", "")
-                        text += f"- **Parent Link**: {parent_href}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "remove_work_package_parent":
-                    work_package_id = arguments["work_package_id"]
-
-                    result = await self.client.remove_work_package_parent(
-                        work_package_id
-                    )
-
-                    text = f"✅ Parent relationship removed successfully:\n\n"
-                    text += f"- **Work Package**: #{work_package_id} is now top-level\n"
-                    text += f"- **Subject**: {result.get('subject', 'N/A')}\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_work_package_children":
-                    parent_id = arguments["parent_id"]
-                    include_descendants = arguments.get("include_descendants", False)
-
-                    result = await self.client.list_work_package_children(
-                        parent_id, include_descendants
-                    )
-                    children = result.get("_embedded", {}).get("elements", [])
-
-                    if not children:
-                        text = f"No {'descendants' if include_descendants else 'children'} found for work package #{parent_id}."
-                    else:
-                        text = f"**{'Descendants' if include_descendants else 'Children'} of Work Package #{parent_id} ({len(children)}):**\n\n"
-                        for child in children:
-                            text += f"- **#{child.get('id', 'N/A')}**: {child.get('subject', 'No subject')}\n"
-
-                            # Show type and status if available
-                            if "_embedded" in child:
-                                embedded = child["_embedded"]
-                                if "type" in embedded:
-                                    text += f"  Type: {embedded['type'].get('name', 'Unknown')}\n"
-                                if "status" in embedded:
-                                    text += f"  Status: {embedded['status'].get('name', 'Unknown')}\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "create_work_package_relation":
-                    data = {
-                        "from_id": arguments["from_id"],
-                        "to_id": arguments["to_id"],
-                        "relation_type": arguments["relation_type"],
-                    }
-
-                    # Add optional fields
-                    for field in ["lag", "description"]:
-                        if field in arguments:
-                            data[field] = arguments[field]
-
-                    result = await self.client.create_work_package_relation(data)
-
-                    text = f"✅ Work package relation created successfully:\n\n"
-                    text += f"- **Relation ID**: #{result.get('id', 'N/A')}\n"
-                    text += f"- **Type**: {result.get('type', 'N/A')}\n"
-                    text += f"- **From**: Work Package #{arguments['from_id']}\n"
-                    text += f"- **To**: Work Package #{arguments['to_id']}\n"
-
-                    if "lag" in result:
-                        text += f"- **Lag**: {result.get('lag', 0)} working days\n"
-                    if "description" in result:
-                        text += (
-                            f"- **Description**: {result.get('description', 'N/A')}\n"
-                        )
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "list_work_package_relations":
-                    filters = None
-                    filter_conditions = []
-
-                    if "work_package_id" in arguments:
-                        wp_id = arguments["work_package_id"]
-                        filter_conditions.append(
-                            {"involved": {"operator": "=", "values": [str(wp_id)]}}
-                        )
-
-                    if "relation_type" in arguments:
-                        rel_type = arguments["relation_type"]
-                        filter_conditions.append(
-                            {"type": {"operator": "=", "values": [rel_type]}}
-                        )
-
-                    if filter_conditions:
-                        filters = json.dumps(filter_conditions)
-
-                    result = await self.client.list_work_package_relations(filters)
-                    relations = result.get("_embedded", {}).get("elements", [])
-
-                    if not relations:
-                        text = "No work package relations found."
-                    else:
-                        text = f"**Work Package Relations ({len(relations)}):**\n\n"
-                        for relation in relations:
-                            text += f"- **#{relation.get('id', 'N/A')}**: {relation.get('type', 'Unknown')} relation\n"
-
-                            if "_embedded" in relation:
-                                embedded = relation["_embedded"]
-                                if "from" in embedded and "to" in embedded:
-                                    from_wp = embedded["from"]
-                                    to_wp = embedded["to"]
-                                    text += f"  From: #{from_wp.get('id', 'N/A')} - {from_wp.get('subject', 'No subject')}\n"
-                                    text += f"  To: #{to_wp.get('id', 'N/A')} - {to_wp.get('subject', 'No subject')}\n"
-
-                            if "lag" in relation:
-                                text += (
-                                    f"  Lag: {relation.get('lag', 0)} working days\n"
-                                )
-                            if "description" in relation:
-                                text += f"  Description: {relation.get('description', 'N/A')}\n"
-                            text += "\n"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "update_work_package_relation":
-                    relation_id = arguments["relation_id"]
-
-                    # Prepare update data
-                    update_data = {}
-                    for field in ["relation_type", "lag", "description"]:
-                        if field in arguments:
-                            update_data[field] = arguments[field]
-
-                    if not update_data:
-                        return [
-                            TextContent(
-                                type="text", text="❌ No fields provided to update."
-                            )
-                        ]
-
-                    result = await self.client.update_work_package_relation(
-                        relation_id, update_data
-                    )
-
-                    text = f"✅ Work package relation #{relation_id} updated successfully:\n\n"
-                    text += f"- **Type**: {result.get('type', 'N/A')}\n"
-
-                    if "lag" in result:
-                        text += f"- **Lag**: {result.get('lag', 0)} working days\n"
-                    if "description" in result:
-                        text += (
-                            f"- **Description**: {result.get('description', 'N/A')}\n"
-                        )
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "delete_work_package_relation":
-                    relation_id = arguments["relation_id"]
-
-                    success = await self.client.delete_work_package_relation(
-                        relation_id
-                    )
-
-                    if success:
-                        text = f"✅ Work package relation #{relation_id} deleted successfully."
-                    else:
-                        text = (
-                            f"❌ Failed to delete work package relation #{relation_id}."
-                        )
-
-                    return [TextContent(type="text", text=text)]
-
-                elif name == "get_work_package_relation":
-                    relation_id = arguments["relation_id"]
-                    result = await self.client.get_work_package_relation(relation_id)
-
-                    text = f"**Work Package Relation Details:**\n\n"
-                    text += f"- **ID**: #{result.get('id', 'N/A')}\n"
-                    text += f"- **Type**: {result.get('type', 'N/A')}\n"
-                    text += f"- **Reverse Type**: {result.get('reverseType', 'N/A')}\n"
-
-                    if "_embedded" in result:
-                        embedded = result["_embedded"]
-                        if "from" in embedded and "to" in embedded:
-                            from_wp = embedded["from"]
-                            to_wp = embedded["to"]
-                            text += f"- **From**: #{from_wp.get('id', 'N/A')} - {from_wp.get('subject', 'No subject')}\n"
-                            text += f"- **To**: #{to_wp.get('id', 'N/A')} - {to_wp.get('subject', 'No subject')}\n"
-
-                    if "lag" in result:
-                        text += f"- **Lag**: {result.get('lag', 0)} working days\n"
-                    if "description" in result:
-                        text += (
-                            f"- **Description**: {result.get('description', 'N/A')}\n"
-                        )
-
-                    return [TextContent(type="text", text=text)]
-
-                else:
-                    return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
+                result_text = await handler(self.client, arguments)
+                return [TextContent(type="text", text=result_text)]
             except Exception as e:
-                logger.error(f"Error executing tool {name}: {e}", exc_info=True)
-
-                error_text = f"❌ Error executing tool '{name}':\n\n{str(e)}"
-
-                return [TextContent(type="text", text=error_text)]
+                logger.error(
+                    f"Error in {name}.{operation}: {e}", exc_info=True
+                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"❌ Error in {name}.{operation}: {str(e)}",
+                    )
+                ]
 
     async def run(self):
-        """Start the MCP server"""
-        # Initialize OpenProject client from environment variables
+        """Start the MCP server."""
         base_url = os.getenv("OPENPROJECT_URL")
         api_key = os.getenv("OPENPROJECT_API_KEY")
-        proxy = os.getenv("OPENPROJECT_PROXY")  # Optional proxy
+        proxy = os.getenv("OPENPROJECT_PROXY")
 
         if not base_url or not api_key:
             logger.error("OPENPROJECT_URL or OPENPROJECT_API_KEY not set!")
-            logger.info("Please set the required environment variables in .env file")
+            logger.info(
+                "Please set the required environment variables in .env file"
+            )
         else:
             self.client = OpenProjectClient(base_url, api_key, proxy)
             logger.info(f"✅ OpenProject Client initialized for {base_url}")
 
-            # Optional: Test connection on startup
-            if os.getenv("TEST_CONNECTION_ON_STARTUP", "false").lower() == "true":
+            if (
+                os.getenv("TEST_CONNECTION_ON_STARTUP", "false").lower()
+                == "true"
+            ):
                 try:
-                    await self.client.test_connection()
+                    await self.client.get("")
                     logger.info("✅ API connection test successful!")
                 except Exception as e:
                     logger.error(f"❌ API connection test failed: {e}")
 
-        # Start the server
         from mcp.server.stdio import stdio_server
 
         async with stdio_server() as (read_stream, write_stream):
             await self.server.run(
-                read_stream, write_stream, self.server.create_initialization_options()
+                read_stream,
+                write_stream,
+                self.server.create_initialization_options(),
             )
 
 
 async def main():
-    """Main entry point"""
+    """Main entry point."""
     logger.info(f"Starting OpenProject MCP Server v{__version__}")
-
     server = OpenProjectMCPServer()
     await server.run()
 
